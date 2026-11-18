@@ -1,0 +1,1592 @@
+/* Lumen: dashboard prediksi CFD dan futures. Feed broker, mesin analog deterministik (tanpa angka acak), TTFM, GXT, renderer canvas. */
+(() => {
+'use strict';
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const bind = (k, v) => $$(`[data-bind="${k}"]`).forEach(e => { e.textContent = v; });
+const dirOf = v => (v > 0 ? 'up' : v < 0 ? 'down' : 'flat');
+const setDir = (k, v) => $$(`[data-bind="${k}"]`).forEach(e => { e.dataset.dir = dirOf(v); });
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const mean = a => a.reduce((s, x) => s + x, 0) / (a.length || 1);
+const std = a => { const m = mean(a); return Math.sqrt(mean(a.map(x => (x - m) ** 2))); };
+const sgn = Math.sign;
+const TF = { '1m': 6e4, '5m': 3e5, '15m': 9e5, '30m': 18e5, '1h': 36e5, '4h': 144e5, '1d': 864e5 };
+const HTF = { '1m': '15m', '5m': '1h', '15m': '4h', '1h': '1d', '4h': '1w', '1d': '1M' };
+const norm = s => String(s).toUpperCase().replace(/[^A-Z0-9]/g, '');
+const tdName = s => (!String(s).includes('/') && /^[A-Z]{6}$/.test(norm(s)) ? `${norm(s).slice(0, 3)}/${norm(s).slice(3)}` : s);
+const SMT_AUTO = { XAUUSD: 'XAGUSD', XAGUSD: 'XAUUSD', EURUSD: 'GBPUSD', GBPUSD: 'EURUSD', AUDUSD: 'NZDUSD', NZDUSD: 'AUDUSD', USDJPY: 'USDCHF', USDCHF: 'USDJPY', EURJPY: 'GBPJPY', GBPJPY: 'EURJPY', US100: 'US500', US500: 'US100', NAS100: 'SPX500', SPX500: 'NAS100', NDX: 'SPX', SPX: 'NDX', USOIL: 'UKOIL', UKOIL: 'USOIL' };
+const CATS = [['fx', 'Forex'], ['met', 'Logam'], ['idx', 'Indeks'], ['eng', 'Energi']];
+const RELAY_SYMS = [
+  ['fx', 'EURUSD', 'Euro / Dolar AS'], ['fx', 'GBPUSD', 'Pound / Dolar AS'], ['fx', 'USDJPY', 'Dolar AS / Yen'], ['fx', 'AUDUSD', 'Dolar Australia / Dolar AS'], ['fx', 'USDCAD', 'Dolar AS / Dolar Kanada'],
+  ['fx', 'USDCHF', 'Dolar AS / Franc'], ['fx', 'NZDUSD', 'Dolar Selandia Baru / Dolar AS'], ['fx', 'EURGBP', 'Euro / Pound'], ['fx', 'EURJPY', 'Euro / Yen'], ['fx', 'GBPJPY', 'Pound / Yen'], ['fx', 'USDIDR', 'Dolar AS / Rupiah'],
+  ['met', 'XAUUSD', 'Emas'], ['met', 'XAGUSD', 'Perak'], ['idx', 'US100', 'Nasdaq 100'], ['idx', 'US500', 'S&amp;P 500'], ['idx', 'US30', 'Dow Jones'], ['idx', 'GER40', 'DAX 40'], ['eng', 'USOIL', 'Minyak WTI'], ['eng', 'UKOIL', 'Minyak Brent']
+];
+const DERIV_PAIR = { OTC_NDX: 'OTC_SPC', OTC_SPC: 'OTC_NDX', OTC_DJI: 'OTC_SPC', OTC_GDAXI: 'OTC_FTSE', OTC_FTSE: 'OTC_GDAXI' };
+const PRESETS = { relay: RELAY_SYMS, deriv: [...RELAY_SYMS.filter(i => (i[0] === 'fx' || i[0] === 'met') && i[1] !== 'USDIDR').map(([c, s, n]) => [c, `frx${s}`, n]), ['idx', 'OTC_NDX', 'Nasdaq 100 (US Tech 100)'], ['idx', 'OTC_SPC', 'S&amp;P 500 (US 500)'], ['idx', 'OTC_DJI', 'Dow Jones (Wall Street 30)'], ['idx', 'OTC_GDAXI', 'DAX 40 (Germany 40)'], ['idx', 'OTC_FTSE', 'FTSE 100 (UK 100)'], ['idx', 'OTC_N225', 'Nikkei 225 (Japan 225)']], twelve: [...RELAY_SYMS.filter(i => i[0] === 'fx' || i[0] === 'met').map(([c, s, n]) => [c, tdName(s), n]), ['idx', 'NDX', 'Nasdaq 100'], ['idx', 'SPX', 'S&amp;P 500'], ['idx', 'DJI', 'Dow Jones'], ['eng', 'WTI/USD', 'Minyak WTI']] };
+PRESETS.relay = [['cry', 'BTCUSD', 'Bitcoin'], ['cry', 'ETHUSD', 'Ethereum'], ...RELAY_SYMS];
+PRESETS.deriv.unshift(['cry', 'cryBTCUSD', 'Bitcoin (BTC/USD)'], ['cry', 'cryETHUSD', 'Ethereum (ETH/USD)']);
+PRESETS.twelve.unshift(['cry', 'BTC/USD', 'Bitcoin'], ['cry', 'ETH/USD', 'Ethereum']);
+Object.assign(SMT_AUTO, { BTCUSD: 'ETHUSD', ETHUSD: 'BTCUSD' }); Object.assign(DERIV_PAIR, { cryBTCUSD: 'cryETHUSD', cryETHUSD: 'cryBTCUSD' });
+const ALPHA = 0.08, BETA = 0.9, SHRINK = 0.5, NU = 5;
+
+/* Pengaturan */
+const DEF = { symbol: 'frxXAUUSD', provider: 'deriv', exec: '5m', relayUrl: '', apiKey: '', tf: '1h', horizon: 24, context: 512, lines: 19, source: 'quant', endpoint: '', drift: 'kalman', dist: 'student', b50: true, b80: true, b95: true, wq: 40, wt: 30, wg: 30, smt: 'auto', layers: { forecast: true, liquidity: true, fvg: true, htf: false, sessions: false } };
+let cfg = { ...DEF, layers: { ...DEF.layers } };
+try { Object.assign(cfg, JSON.parse(localStorage.getItem('lumen.cfg') || '{}')); } catch { /* abaikan */ }
+if (cfg.v !== 3) { if (!cfg.relayUrl && !cfg.apiKey) { cfg.provider = DEF.provider; cfg.symbol = DEF.symbol; } cfg.smt = 'auto'; delete cfg.venue; cfg.v = 3; }
+const save = () => { try { localStorage.setItem('lumen.cfg', JSON.stringify(cfg)); } catch { /* abaikan */ } };
+const S = { candles: [], pair: [], an: null, ext: null, bt: null, btKey: '', view: { bars: 90, off: 0 }, feed: { ws: null, tries: 0, last: 0, lat: 0, skew: 0, ticks: [], reconnects: 0, gaps: 0, gen: 0, rtt: 0, iv: 0, ep: 0 }, mouse: null, dirty: true, hud: true, timer: 0, px: 0, live: { hit: 0, n: 0, pend: null }, reveal: -1e9, stage: false, qDirty: false, lbDirty: false, lbT: 0, dt: 16, tF: 0, lite: false, anchor: 0, src: '', digits: 0, anSet: null, anKey: '', visP: 0, ed: null, edKey: '', anId: 0, off: null, offCtx: null, fcKey: '', fcPrep: null, closed: null, dsyms: null, dname: '', ctx: freshCtx(), rv: { x: 1, v: 0 }, tmp: null, tmpCtx: null };
+
+/* Format */
+const fmt = (p, d) => { const x = Math.abs(p), n = d ?? (S.digits || (x >= 100 ? 2 : x >= 10 ? 3 : 5)); return p.toLocaleString('en-US', { minimumFractionDigits: n, maximumFractionDigits: n }); };
+const pct = (x, d = 2) => `${x >= 0 ? '+' : ''}${(x * 100).toFixed(d)}%`;
+const hms = ms => { const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); return `${h ? h + ':' : ''}${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`; };
+const log = (msg, level = 'ok') => { const ol = $('#engine-log'), li = document.createElement('li'); li.dataset.level = level; li.textContent = `${new Date().toISOString().slice(11, 19)} ${msg}`; ol.prepend(li); while (ol.children.length > 40) ol.lastChild.remove(); };
+
+/* Statistik: invers CDF normal (Acklam), kuantil Student-t via Cornish-Fisher, berskala varians satu */
+const zInv = p => {
+  const a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357751867269, -30.66479806614716, 2.506628277459239];
+  const b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
+  const c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+  const d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
+  const tail = q => (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  if (p < 0.02425) return tail(Math.sqrt(-2 * Math.log(p)));
+  if (p > 0.97575) return -tail(Math.sqrt(-2 * Math.log(1 - p)));
+  const q = p - 0.5, r = q * q;
+  return ((((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q) / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+};
+const qInv = p => {
+  const z = zInv(p);
+  if (cfg.dist === 'normal') return z;
+  const t = z + (z ** 3 + z) / (4 * NU) + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * NU ** 2) + (3 * z ** 7 + 19 * z ** 5 + 17 * z ** 3 - 15 * z) / (384 * NU ** 3);
+  return t * Math.sqrt((NU - 2) / NU);
+};
+const solve = (A, b) => {
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let i = 0; i < n; i++) {
+    let p = i; for (let j = i + 1; j < n; j++) if (Math.abs(M[j][i]) > Math.abs(M[p][i])) p = j;
+    [M[i], M[p]] = [M[p], M[i]];
+    for (let j = i + 1; j < n; j++) { const f = M[j][i] / M[i][i]; for (let k = i; k <= n; k++) M[j][k] -= f * M[i][k]; }
+  }
+  const x = Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) { let s = M[i][n]; for (let j = i + 1; j < n; j++) s -= M[i][j] * x[j]; x[i] = s / M[i][i]; }
+  return x;
+};
+const arFit = (r, p = 4, lam = 0.3) => {
+  const A = Array.from({ length: p }, () => Array(p).fill(0)), b = Array(p).fill(0);
+  for (let t = p; t < r.length; t++) for (let i = 0; i < p; i++) { b[i] += r[t - 1 - i] * r[t]; for (let j = 0; j < p; j++) A[i][j] += r[t - 1 - i] * r[t - 1 - j]; }
+  const sc = mean(A.map((row, i) => row[i])) || 1;
+  for (let i = 0; i < p; i++) A[i][i] += lam * sc;
+  return solve(A, b);
+};
+/* Filter Kalman local linear trend pada log harga. Parameter noise diambil dari 100 return pertama saja (kausal). */
+const kalman = (ly, s2) => {
+  const n = ly.length, R = s2, q1 = 0.1 * s2, q2 = 0.002 * s2, slope = new Array(n).fill(0);
+  let l = ly[0], b = 0, P00 = s2, P01 = 0, P11 = s2 * 0.01;
+  for (let t = 1; t < n; t++) {
+    const l_ = l + b, A00 = P00 + 2 * P01 + P11 + q1, A01 = P01 + P11, A11 = P11 + q2;
+    const K0 = A00 / (A00 + R), K1 = A01 / (A00 + R), e = ly[t] - l_;
+    l = l_ + K0 * e; b += K1 * e;
+    P00 = (1 - K0) * A00; P01 = (1 - K0) * A01; P11 = A11 - K1 * A01;
+    slope[t] = b;
+  }
+  return { slope };
+};
+/* Model: return log, GARCH(1,1) dengan variance targeting, Kalman, AR ridge */
+function fit(cs) {
+  const n = cs.length, ly = cs.map(c => Math.log(c.c)), r = ly.map((v, i) => (i ? v - ly[i - 1] : 0));
+  const V = Math.pow(std(r.slice(1, 101)), 2) || 1e-8, om = V * (1 - ALPHA - BETA), hv = new Array(n);
+  hv[0] = V; for (let t = 1; t < n; t++) hv[t] = om + ALPHA * r[t] ** 2 + BETA * hv[t - 1];
+  return { n, ly, r, hv, V, kal: kalman(ly, V), w: cfg.drift === 'ar' ? arFit(r.slice(1, 201)) : [] };
+}
+function muPath(M, t, H) {
+  const out = new Array(H).fill(0);
+  if (cfg.drift === 'zero') return out;
+  if (cfg.drift === 'ar') {
+    const h = M.w.map((_, i) => M.r[t - i] || 0); let c = 0;
+    for (let k = 0; k < H; k++) { const y = M.w.reduce((s, w, i) => s + w * h[i], 0); h.unshift(y); h.pop(); out[k] = c += y; }
+    return out;
+  }
+  const cap = 0.25 * Math.sqrt(M.hv[t]), d = clamp(M.kal.slope[t], -cap, cap) * SHRINK;
+  for (let k = 0; k < H; k++) out[k] = d * (k + 1);
+  return out;
+}
+function varPath(M, t, H) {
+  const rho = ALPHA + BETA, v1 = M.hv[t];
+  return Array.from({ length: H }, (_, i) => { const k = i + 1; return k * M.V + (v1 - M.V) * (1 - rho ** k) / (1 - rho); });
+}
+/* Dasar rata-rata dan varians per langkah, disesuaikan dengan sisa waktu candle yang sedang berjalan */
+function baseMV(M, H) {
+  const t = M.n - 1, mu0 = muPath(M, t, H), vp = varPath(M, t, H), l = S.candles[S.candles.length - 1], ms = TF[cfg.tf];
+  const rem = S.closed ? 1 : l ? clamp((l.t + ms - (Date.now() + S.feed.skew)) / ms, 0.05, 1) : 1, dv0 = vp[0], m0 = mu0[0];
+  return { mu0: mu0.map(m => m - (1 - rem) * m0), vp: vp.map(v => v - (1 - rem) * dv0) };
+}
+/* Prakiraan kuantil: matriks volatilitas GARCH-t, pusat dari drift statistik dan pola analog, digeser oleh bias gabungan Quant, TTFM, GXT */
+function quantFc(M, H, base, tilt = 0, ad = null, st = null) {
+  const mu0 = base.mu0, vp0 = base.vp, mu = st ? st.mu : mu0.map((m, k) => (ad ? 0.5 * m + 0.5 * ad[k] : m) + tilt * Math.sqrt(vp0[k])), vp = st ? st.vp : vp0;
+  const cl = v => (st ? clamp(v, st.lo / liveP(), st.hi / liveP()) : v);
+  const rel = (p, k) => cl(Math.exp(mu[k - 1] + Math.sqrt(vp[k - 1]) * qInv(p)));
+  const up = k => { let lo = 1e-6, hi = 1 - 1e-6; const tg = -mu[k - 1] / Math.sqrt(vp[k - 1]); for (let i = 0; i < 40; i++) { const m = (lo + hi) / 2; if (qInv(m) < tg) lo = m; else hi = m; } return 1 - lo; };
+  return { get P0() { return liveP(); }, Q: (p, k) => liveP() * rel(p, k), up, rel, H, mu, vp, st, name: 'Quant ensemble', state: st ? 'Median konfluensi, envelope terkunci' : 'Deterministik, tanpa angka acak' };
+}
+/* Pencocokan pola analog: jendela return terakhir dan konteks struktur (premium/discount, kedekatan likuiditas ERL/IRL, displacement, FVG)
+   dicocokkan dengan seluruh riwayat. Tetangga terdekat yang tidak berdekatan dipakai lanjutannya, berbobot kemiripan. Deterministik. */
+function analogSet(M, cs, H) {
+  const n = M.n, W = 24, r = M.r, ly = M.ly, sg = i => Math.sqrt(M.hv[i]) || 1e-9;
+  if (n < W + H + 80) return null;
+  const feat = j => {
+    const s = sg(j - 1), shape = []; for (let w = 0; w < W; w++) shape.push(r[j - W + 1 + w] / s);
+    let hi = -Infinity, lo = Infinity, hi2 = -Infinity, lo2 = Infinity, fv = 0;
+    for (let m = 0; m < 50; m++) {
+      const v = ly[j - m]; if (v > hi) hi = v; if (v < lo) lo = v;
+      if (m < 20) { if (v > hi2) hi2 = v; if (v < lo2) lo2 = v; if (m < 18) { const a = cs[j - m - 2], b = cs[j - m]; if (b.l > a.h) fv++; else if (b.h < a.l) fv--; } }
+    }
+    const sj = sg(j);
+    return { shape, st: [((ly[j] - lo) / (hi - lo || 1)) * 2 - 1, Math.min(6, (hi2 - ly[j]) / sj) / 3, Math.min(6, (ly[j] - lo2) / sj) / 3, clamp((ly[j] - ly[j - 5]) / sj, -6, 6) / 3, clamp(fv, -4, 4) / 2] };
+  };
+  const cur = feat(n - 1), cand = [];
+  for (let j = 60; j <= n - H - 2; j++) {
+    const f = feat(j); let d = 0, e = 0;
+    for (let w = 0; w < W; w++) d += (f.shape[w] - cur.shape[w]) ** 2;
+    for (let m = 0; m < 5; m++) e += (f.st[m] - cur.st[m]) ** 2;
+    cand.push([d / W + 0.16 * e, j]);
+  }
+  cand.sort((a, b) => a[0] - b[0]);
+  const pick = [], K = Math.min(100, Math.max(20, Math.floor(cand.length / 6)));
+  for (const c of cand) { if (pick.every(p => Math.abs(p[1] - c[1]) >= 5)) pick.push(c); if (pick.length >= K) break; }
+  const tau = pick[Math.floor(pick.length / 2)][0] || 1e-6, ws = pick.map(p => Math.exp(-p[0] / tau)), wsum = ws.reduce((a, b) => a + b, 0);
+  return { u: pick.map(([, j]) => { const s = sg(j); return Array.from({ length: H }, (_, k) => r[j + k + 1] / s); }), w: ws.map(v => v / wsum), n: pick.length, tau };
+}
+function analogPaths(set, vp, H) {
+  const dv = vp.map((v, k) => Math.max(v - (k ? vp[k - 1] : 0), 0)), dm = new Array(H + 1).fill(0);
+  const paths = set.u.map((u, i) => { const x = [0]; let acc = 0; for (let k = 0; k < H; k++) { acc += Math.sqrt(dv[k]) * u[k]; x.push(acc); dm[k + 1] += set.w[i] * acc; } return x; });
+  return { paths, dm };
+}
+function extFc(ls, P0, H) {
+  const Q = (p, k) => { const i = ls.findIndex(l => l.p >= p); if (i < 0) return ls.at(-1).v[k - 1]; if (i === 0) return ls[0].v[k - 1]; const a = ls[i - 1], b = ls[i], w = (p - a.p) / (b.p - a.p); return a.v[k - 1] + w * (b.v[k - 1] - a.v[k - 1]); };
+  const up = k => { let lo = 0, hi = 1; for (let i = 0; i < 30; i++) { const m = (lo + hi) / 2; if (Q(m, k) < P0) lo = m; else hi = m; } return 1 - lo; };
+  return { P0, Q, up, H, name: 'Model eksternal', state: 'Memakai endpoint eksternal' };
+}
+/* Uji walk-forward: setiap titik uji memakai filter kausal, hanya data sebelum titik itu */
+function backtest(M, H) {
+  const z = qInv(0.9), t0 = 210; let n = 0, hn = 0, hit = 0, cov = 0, em = 0, en = 0;
+  for (let t = t0; t < M.n - H; t += 3) {
+    const mu = muPath(M, t, H)[H - 1], sd = Math.sqrt(varPath(M, t, H)[H - 1]), y = M.ly[t + H] - M.ly[t];
+    n++; em += Math.abs(y - mu); en += Math.abs(y);
+    if (Math.abs(y - mu) <= z * sd) cov++;
+    if (mu) { hn++; if (sgn(mu) === sgn(y)) hit++; }
+  }
+  return { n, hit: hn ? hit / hn : NaN, cov: n ? cov / n : NaN, skill: en ? 1 - em / en : NaN };
+}
+/* Quant: tren Kalman, momentum deret waktu, mean reversion, volatilitas GARCH, rezim, eksponen Hurst */
+function quant(M, cs) {
+  const t = M.n - 1, sig = Math.sqrt(M.hv[t]), trendZ = (M.kal.slope[t] * Math.sqrt(24)) / sig;
+  const ts = mean([12, 48, 168].filter(L => L < t).map(L => Math.tanh((M.ly[t] - M.ly[t - L]) / (sig * Math.sqrt(L)) / 1.5)));
+  const w = cs.slice(-20).map(c => c.c), zmr = (w[w.length - 1] - mean(w)) / (std(w) || 1);
+  const pts = [1, 2, 4, 8, 16].map(k => { const d = []; for (let i = k; i < M.n; i++) d.push(M.ly[i] - M.ly[i - k]); return [Math.log(k), Math.log(std(d) ** 2 || 1e-12)]; });
+  const mx = mean(pts.map(p => p[0])), my = mean(pts.map(p => p[1]));
+  const hurst = clamp(pts.reduce((s, p) => s + (p[0] - mx) * (p[1] - my), 0) / pts.reduce((s, p) => s + (p[0] - mx) ** 2, 0) / 2, 0, 1);
+  const hist = M.hv.slice(-250).map(Math.sqrt), pc = hist.filter(x => x <= sig).length / hist.length;
+  const regime = pc < 0.25 ? 'Rendah' : pc < 0.75 ? 'Normal' : pc < 0.95 ? 'Tinggi' : 'Ekstrem';
+  const score = clamp(100 * (0.5 * Math.tanh(trendZ) + 0.4 * ts - 0.1 * Math.tanh(zmr / 2)), -100, 100);
+  return { trendZ, score, regime, hurst, ts, zmr, text: {
+    trend: `${(M.kal.slope[t] * 1e4).toFixed(2)} bps per candle (z ${trendZ.toFixed(2)})`, tsmom: ts.toFixed(2), zscore: zmr.toFixed(2),
+    vol: `${(sig * 100).toFixed(3)}% per candle`, regime, hurst: `${hurst.toFixed(2)} (${hurst > 0.55 ? 'cenderung tren' : hurst < 0.45 ? 'cenderung berbalik' : 'mendekati acak'})` } };
+}
+/* TTFM (TTrades Fractal Model): urutan C1, C2, C3 pada HTF, sweep, T-spot (midpoint logaritmik), FVG */
+const bucket = (t0, tf) => {
+  let A = ['1d', '1w', '1M'].includes(tf) ? S.anchor : 0; if (A > 432e5) A -= 864e5;
+  const t = t0 - A, d = new Date(t);
+  if (tf === '1M') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) + A;
+  if (tf === '1w') return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - ((d.getUTCDay() + 6) % 7)) + A;
+  return Math.floor(t / TF[tf]) * TF[tf] + A;
+};
+const resample = (cs, tf) => {
+  const out = [];
+  for (const c of cs) { const b = bucket(c.t, tf), o = out[out.length - 1]; if (o && o.t === b) { o.h = Math.max(o.h, c.h); o.l = Math.min(o.l, c.l); o.c = c.c; o.end = c.t; } else out.push({ t: b, o: c.o, h: c.h, l: c.l, c: c.c, end: c.t }); }
+  return out;
+};
+function ttfm(cs) {
+  const name = HTF[cfg.tf], h = resample(cs, name), none = { score: 0, htf: name, seq: 'Data HTF belum cukup', sweep: 'Tidak ada', tspot: null, htfc: [] };
+  if (h.length < 4) return none;
+  const [c1, c2, c3] = h.slice(-3), px = cs[cs.length - 1].c; let score = 0, seq, sweep = 'Tidak ada';
+  if (c2.l < c1.l && c2.c > c1.l) { seq = 'C2 menyapu low C1 lalu menutup di atasnya, C3 berjalan'; sweep = 'Low C1 (bullish)'; score = 60; }
+  else if (c2.h > c1.h && c2.c < c1.h) { seq = 'C2 menyapu high C1 lalu menutup di bawahnya, C3 berjalan'; sweep = 'High C1 (bearish)'; score = -60; }
+  else if (c2.c > c1.h) { seq = 'C2 menutup di atas high C1 (kontinuasi naik)'; score = 25; }
+  else if (c2.c < c1.l) { seq = 'C2 menutup di bawah low C1 (kontinuasi turun)'; score = -25; }
+  else seq = 'C2 inside bar C1 (konsolidasi)';
+  if (score) score = sgn(score) * (Math.abs(score) + (sgn(score) * (px - c2.c) > 0 ? 25 : -20));
+  const lo = Math.log(c2.o), lc = Math.log(c2.c), lh = Math.log(c2.h), ll = Math.log(c2.l), up = lh - Math.max(lo, lc), dn = Math.min(lo, lc) - ll;
+  const mid = Math.max(up, dn) > Math.abs(lc - lo) ? (up >= dn ? (lh + Math.max(lo, lc)) / 2 : (Math.min(lo, lc) + ll) / 2) : (lh + ll) / 2;
+  return { score: clamp(score, -100, 100), htf: name, seq, sweep, tspot: Math.exp(mid), htfc: [c1, c2, c3] };
+}
+function fvgs(cs) {
+  const out = [];
+  for (let i = Math.max(2, cs.length - 300); i < cs.length; i++) {
+    const a = cs[i - 2], c = cs[i];
+    if (c.l > a.h) out.push({ i: i - 1, lo: a.h, hi: c.l, dir: 1 });
+    else if (c.h < a.l) out.push({ i: i - 1, lo: c.h, hi: a.l, dir: -1 });
+  }
+  return out.filter(g => { for (let j = g.i + 2; j < cs.length; j++) if (g.dir > 0 ? cs[j].c < g.lo : cs[j].c > g.hi) return false; return true; }).slice(-8);
+}
+/* GXT: swing, ERL/IRL, premium dan discount, displacement, divergensi SMT */
+
+function gxt(cs, pair) {
+  const n = cs.length, px = cs[n - 1].c, hi = [], lo = [], K = 3, p = pairSym() || 'aset pembanding';
+  for (let i = K; i < n - K; i++) {
+    let h = true, l = true;
+    for (let j = 1; j <= K; j++) { if (cs[i].h <= cs[i - j].h || cs[i].h <= cs[i + j].h) h = false; if (cs[i].l >= cs[i - j].l || cs[i].l >= cs[i + j].l) l = false; }
+    if (h) hi.push(i); if (l) lo.push(i);
+  }
+  if (!hi.length || !lo.length) return { score: 0, pair: p, erl: null, irl: null, zone: 'Netral', smt: 'Belum ada swing', disp: 'Tidak ada', sweep: 'Tidak ada', ob: 'Tidak ada', obs: [] };
+  const erl = cs[hi.at(-1)].h, irl = cs[lo.at(-1)].l, pos = erl > irl ? (px - irl) / (erl - irl) : 0.5, zs = clamp((0.5 - pos) * 2, -1, 1);
+  const zone = pos > 1 ? 'Premium (di atas ERL)' : pos < 0 ? 'Discount (di bawah IRL)' : pos >= 0.5 ? `Premium (${(pos * 100).toFixed(0)}% range)` : `Discount (${(pos * 100).toFixed(0)}% range)`;
+  const atr = mean(cs.slice(-15).map((c, i, a) => (i ? Math.max(c.h - c.l, Math.abs(c.h - a[i - 1].c), Math.abs(c.l - a[i - 1].c)) : c.h - c.l)).slice(1));
+  let dd = 0, ago = 0;
+  for (let i = n - 1; i >= n - 8; i--) if (Math.abs(cs[i].c - cs[i].o) > 1.5 * atr) { dd = sgn(cs[i].c - cs[i].o); ago = n - 1 - i; break; }
+  let smt = 0, smtText = `Tidak ada divergensi dengan ${p}`;
+  const pm = new Map(pair.map(c => [c.t, c])), a = cs.slice(-20).map(c => [c, pm.get(c.t)]).filter(x => x[1]);
+  if (a.length >= 18) {
+    const pv = a.slice(0, -3), rc = a.slice(-3), mx = (r, k, f) => Math[f](...r.map(x => x[k].h ?? 0)), hiOf = (r, k) => Math.max(...r.map(x => x[k].h)), loOf = (r, k) => Math.min(...r.map(x => x[k].l));
+    const nh = [hiOf(rc, 0) > hiOf(pv, 0), hiOf(rc, 1) > hiOf(pv, 1)], nl = [loOf(rc, 0) < loOf(pv, 0), loOf(rc, 1) < loOf(pv, 1)];
+    if (nh[0] !== nh[1]) { smt = -1; smtText = `Bearish: ${nh[0] ? cfg.symbol : p} cetak high baru, satunya tidak ikut`; }
+    else if (nl[0] !== nl[1]) { smt = 1; smtText = `Bullish: ${nl[0] ? cfg.symbol : p} cetak low baru, satunya tidak ikut`; }
+    void mx;
+  }
+  const obs = orderBlocks(cs), inOb = obs.reduce((s, o) => (px >= o.lo && px <= o.hi ? s + o.dir : s), 0);
+  let sw = 0; for (let i = n - 1; i >= n - 6; i--) { if (cs[i].h > erl && cs[i].c < erl) { sw = -1; break; } if (cs[i].l < irl && cs[i].c > irl) { sw = 1; break; } }
+  return { score: clamp(40 * smt + 25 * dd + 35 * zs + 25 * sw + 20 * clamp(inOb, -1, 1), -100, 100), pair: p, erl, irl, zone, smt: smtText, disp: dd ? `${dd > 0 ? 'Naik' : 'Turun'}, ${ago} candle lalu` : 'Tidak ada',
+    sweep: sw ? (sw > 0 ? 'Sweep IRL lalu pulih (bullish)' : 'Sweep ERL lalu ditolak (bearish)') : 'Tidak ada', ob: inOb ? (inOb > 0 ? 'Harga di order block bullish' : 'Harga di order block bearish') : (obs.length ? `${obs.length} OB aktif, harga di luar` : 'Tidak ada'), obs, sw, zs, smtv: smt };
+}
+/* Order block: candle berlawanan terakhir sebelum displacement yang menembus strukturnya, aktif selama belum ditutup melewati zonanya */
+function orderBlocks(cs) {
+  const out = [], n = cs.length, atr = mean(cs.slice(-50).map(c => c.h - c.l)) || 1e-9;
+  for (let i = Math.max(5, n - 200); i < n - 2; i++) {
+    const c = cs[i], nx = cs[i + 1], body = nx.c - nx.o;
+    if (c.c < c.o && body > 1.2 * atr && nx.c > c.h) out.push({ i, lo: c.l, hi: c.h, dir: 1 });
+    else if (c.c > c.o && -body > 1.2 * atr && nx.c < c.l) out.push({ i, lo: c.l, hi: c.h, dir: -1 });
+  }
+  return out.filter(o => { for (let j = o.i + 2; j < n; j++) if (o.dir > 0 ? cs[j].c < o.lo : cs[j].c > o.hi) return false; return true; }).slice(-4);
+}
+/* Target proyeksi berbasis konfluensi likuiditas multi-timeframe dan rencana eksekusi sesi New York: bias H4, konfirmasi M5 sampai M30, diuji pada riwayat candle nyata. Deterministik. */
+const TFN = { '1m': 'M1', '5m': 'M5', '15m': 'M15', '30m': 'M30', '1h': 'H1', '4h': 'H4', '1d': 'D1' };
+const LABEL_ORDER = ['Moving Average 19', 'Moving Average 200', 'FVG bullish', 'FVG bearish', 'Order Block bullish', 'Order Block bearish', 'T-spot TTFM', 'Equilibrium range', 'High hari sebelumnya', 'Low hari sebelumnya', 'High sesi Asia', 'Low sesi Asia', 'High sesi London', 'Low sesi London', 'Swing high H4', 'Swing low H4', 'External Liquidity Pool'];
+const sma = (a, n) => mean(a.slice(-n));
+const ema = (a, n) => { const k = 2 / (n + 1); let e = a[0]; for (let i = 1; i < a.length; i++) e = a[i] * k + e * (1 - k); return e; };
+const erf = x => { const s = sgn(x), a = Math.abs(x), t = 1 / (1 + 0.3275911 * a); return s * (1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-a * a)); };
+const cdf = z => 0.5 * (1 + erf(z / Math.SQRT2));
+const hhmm = v => { const d = new Date(v); return `${d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', hour12: false }).replace(':', '.')}${d.getDate() !== new Date().getDate() ? ' besok' : ''}`; };
+const isCrypto = () => /^cry|^BTC|^ETH/i.test(cfg.symbol);
+const pipOf = (sym, px) => {
+  const t = String(sym).replace(/^frx/, '').replace(/[^A-Za-z]/g, '').toUpperCase();
+  if (/^(XAU|XPT|XPD)/.test(t)) return 0.1; if (/^XAG/.test(t)) return 0.01;
+  if (/^[A-Z]{6}$/.test(t) && !/^(BTC|ETH|OTC|CRY)/.test(t)) return /JPY/.test(t) ? 0.01 : 0.0001;
+  return px * 0.0001;
+};
+/* Data konteks: H4 dan timeframe eksekusi dengan riwayat dalam, dimuat dari sumber yang sama */
+function freshCtx() { return { h4: [], ex: [], ready: false, bt: null, pages: 0, err: '', started: false }; }
+const mergeK = (a, b) => { const m = new Map(); a.forEach(k => m.set(k.t, k)); b.forEach(k => m.set(k.t, k)); return [...m.values()].sort((x, y) => x.t - y.t); };
+function ctxIn(kind, rows) { const c = S.ctx, arr = rows.map(rowK).filter(k => Number.isFinite(k.c) && Number.isFinite(k.t)); if (kind === 'h4') c.h4 = mergeK(c.h4, arr); else c.ex = mergeK(c.ex, arr); }
+function ctxCheck() { const c = S.ctx; if (c.h4.length >= 60 && c.ex.length >= 300) { annotate(c.ex); c.ready = true; c.err = ''; c.tr = runBacktest(); c.cal = calibrate(c.tr); extPull(); queue(true); } }
+function derivCtx(m) {
+  const id = m.req_id, rows = (m.candles || []).map(c => [c.epoch * 1000, c.open, c.high, c.low, c.close, 0]);
+  if (id === 21 || id === 41) ctxIn('h4', rows);
+  else { ctxIn('ex', rows); if (id >= 30 && id < 33 && rows.length >= 4990 && S.ctx.pages < 2) { S.ctx.pages++; S.feed.send({ ticks_history: cfg.symbol, adjust_start_time: 1, count: 5000, end: rows[0][0] / 1000 - 1, start: 1, style: 'candles', granularity: DERIV_GR[cfg.exec], req_id: 30 + S.ctx.pages }); } }
+  ctxCheck();
+}
+function ctxPull(full) {
+  const n4 = full ? 2500 : 120, nx = full ? 5000 : 700, c = S.ctx;
+  if (cfg.provider === 'deriv') { const s = o => S.feed.send && S.feed.send({ ticks_history: cfg.symbol, adjust_start_time: 1, end: 'latest', start: 1, style: 'candles', ...o }); s({ count: n4, granularity: 14400, req_id: full ? 21 : 41 }); s({ count: nx, granularity: DERIV_GR[cfg.exec], req_id: full ? 30 : 42 }); }
+  else if (cfg.provider === 'twelve') Promise.all([tdHistory(cfg.symbol, n4, '4h'), tdHistory(cfg.symbol, nx, cfg.exec)]).then(([a, b]) => { ctxIn('h4', a); ctxIn('ex', b); ctxCheck(); }).catch(e => { c.err = `Data eksekusi gagal dimuat: ${e.message}`; });
+  else if (S.feed.ws && S.feed.ws.readyState === 1) { S.feed.ws.send(JSON.stringify({ type: 'history_req', symbol: cfg.symbol, tf: '4h', count: n4, id: 'h4' })); S.feed.ws.send(JSON.stringify({ type: 'history_req', symbol: cfg.symbol, tf: cfg.exec, count: nx * 3, id: 'ex' })); }
+}
+/* Waktu New York dan hari perdagangan (pergantian 17.00 ET) */
+const NYF = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour12: false, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', weekday: 'short' });
+const nyp = ms => { const o = {}; for (const p of NYF.formatToParts(new Date(ms))) o[p.type] = p.value; return { y: +o.year, mo: +o.month, d: +o.day, h: +o.hour % 24, mi: +o.minute, wd: o.weekday }; };
+function annotate(arr) { for (const k of arr) { if (k.td !== undefined) continue; const n = nyp(k.t); k.nh = n.h; k.nm = n.mi; k.wd = n.wd; k.td = Date.UTC(n.y, n.mo - 1, n.d + (n.h >= 17 ? 1 : 0)) / 864e5; } }
+const getH4 = () => (S.ctx.h4.length >= 60 ? S.ctx.h4 : TF[cfg.tf] <= 36e5 ? resample(S.candles, '4h') : []);
+/* Bias H4: CTC (close ke close), sapuan struktur, posisi terhadap MA19, dan tren 6 candle. Butuh 3 dari 4 searah. */
+function h4Bias(h4, upto) {
+  let n = h4.length; while (n > 0 && h4[n - 1].t + 144e5 > upto) n--;
+  if (n < 30) return { b: 0, s: 0, txt: 'Data H4 belum cukup.' };
+  const c2 = h4[n - 1], c1 = h4[n - 2], ma = ema(h4.slice(Math.max(0, n - 120), n).map(c => c.c), 19);
+  const ctc = sgn(c2.c - c1.c), st = (c2.l < c1.l && c2.c > c1.l) || c2.c > c1.h ? 1 : (c2.h > c1.h && c2.c < c1.h) || c2.c < c1.l ? -1 : 0, m = sgn(c2.c - ma), tr = sgn(c2.c - h4[n - 7].c), s = ctc + st + m + tr;
+  const w = v => (v > 0 ? 'naik' : v < 0 ? 'turun' : 'netral');
+  return { b: s >= 3 ? 1 : s <= -3 ? -1 : 0, s, txt: `CTC ${w(ctc)}, struktur ${st > 0 ? 'sapuan low lalu pulih' : st < 0 ? 'sapuan high lalu ditolak' : 'netral'}, posisi vs MA19 ${w(m)}, tren 6 candle ${w(tr)}.` };
+}
+/* Level likuiditas pada waktu T: high dan low hari sebelumnya, sesi Asia dan London, swing H4 yang belum tersapu */
+function levelsAt(ex, h4, i, T) {
+  const X = ex[i], td = X.td, out = []; let ph = -Infinity, pl = Infinity, ah = -Infinity, al = Infinity, lh = -Infinity, ll = Infinity, ptd = null;
+  for (let j = i; j >= 0 && X.t - ex[j].t <= 60 * 36e5; j--) {
+    const k = ex[j];
+    if (k.td === td) { if (k.nh >= 20 || k.nh < 2) { if (k.h > ah) ah = k.h; if (k.l < al) al = k.l; } else if (k.nh >= 2 && k.nh < 5) { if (k.h > lh) lh = k.h; if (k.l < ll) ll = k.l; } }
+    else if (k.td < td) { if (ptd === null) ptd = k.td; if (k.td === ptd) { if (k.h > ph) ph = k.h; if (k.l < pl) pl = k.l; } }
+  }
+  const add = (p, label) => { if (Number.isFinite(p)) out.push({ p, label }); };
+  add(ph, 'High hari sebelumnya'); add(pl, 'Low hari sebelumnya'); add(ah, 'High sesi Asia'); add(al, 'Low sesi Asia'); add(lh, 'High sesi London'); add(ll, 'Low sesi London');
+  let n = h4.length; while (n > 0 && h4[n - 1].t + 144e5 > T) n--;
+  const w = h4.slice(Math.max(0, n - 60), n);
+  for (let a = 2; a < w.length - 2; a++) {
+    const c = w[a];
+    if (c.h > w[a - 1].h && c.h > w[a - 2].h && c.h > w[a + 1].h && c.h > w[a + 2].h && w.slice(a + 3).every(k => k.h < c.h)) add(c.h, 'Swing high H4');
+    if (c.l < w[a - 1].l && c.l < w[a - 2].l && c.l < w[a + 1].l && c.l < w[a + 2].l && w.slice(a + 3).every(k => k.l > c.l)) add(c.l, 'Swing low H4');
+  }
+  if (S.gex && Math.abs(S.gex.spot - X.c) / X.c < 0.2) S.gex.levels.forEach(l => add(l.p, l.label));
+  return out;
+}
+/* ===== Sinyal eksekusi: konfluensi lapis demi lapis, hukum sebab akibat, diuji pada riwayat candle nyata ===== */
+function indicFrom(ex, from) {
+  for (let i = Math.max(1, from); i < ex.length; i++) {
+    const k = ex[i], p = ex[i - 1], tr = Math.max(k.h - k.l, Math.abs(k.h - p.c), Math.abs(k.l - p.c)), d = k.c - p.c;
+    if (i <= 14) { k.ag = (p.ag || 0) + Math.max(d, 0) / 14; k.al = (p.al || 0) + Math.max(-d, 0) / 14; k.atr = (p.atr || 0) + tr / 14; }
+    else { k.ag = (p.ag * 13 + Math.max(d, 0)) / 14; k.al = (p.al * 13 + Math.max(-d, 0)) / 14; k.atr = (p.atr * 13 + tr) / 14; }
+    k.rsi = k.al ? 100 - 100 / (1 + k.ag / k.al) : 100; k.ema = (p.ema ?? p.c) * (1 - 2 / 22) + k.c * (2 / 22);
+  }
+}
+const nyMins = ms => { const n = nyp(ms); return n.h * 60 + n.mi; };
+const hh = v => new Date(v).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', hour12: false }).replace(':', '.');
+function fvgNear(ex, i, dir, atr) {
+  const X = ex[i];
+  for (let j = i - 1; j >= Math.max(2, i - 120); j--) {
+    const a = ex[j - 2], b = ex[j];
+    if (dir > 0 && b.l > a.h && b.l <= X.c + 0.3 * atr && b.l >= X.c - 1.5 * atr && ex.slice(j + 1, i + 1).every(k => k.c > a.h)) return { lo: a.h, hi: b.l };
+    if (dir < 0 && b.h < a.l && b.h >= X.c - 0.3 * atr && b.h <= X.c + 1.5 * atr && ex.slice(j + 1, i + 1).every(k => k.c < a.l)) return { lo: b.h, hi: a.l };
+  }
+  return null;
+}
+/* Faktor konfluensi yang dihitung dari harga: skor maksimum 10,5. Dipakai sama persis oleh uji historis dan sinyal langsung. */
+function factorsAt(ex, h4, i, dir, B, T) {
+  const X = ex[i], pip = pipOf(cfg.symbol, X.c), atr = X.atr || pip * 5, items = []; let s = 0;
+  const add = (k, w, ok, txt) => { items.push({ k, w, ok, txt }); if (ok) s += w; };
+  add('Bias H4: CTC, struktur, MA19, tren', Math.abs(B.s) >= 4 ? 2 : 1.5, true, B.txt);
+  const sweepAt = j => { let mn = Infinity, mx = -Infinity; for (let q = j - 12; q < j; q++) { if (ex[q].l < mn) mn = ex[q].l; if (ex[q].h > mx) mx = ex[q].h; } return dir > 0 ? ex[j].l < mn && ex[j].c > mn : ex[j].h > mx && ex[j].c < mx; };
+  add(dir > 0 ? 'Sapuan likuiditas low 12 candle' : 'Sapuan likuiditas high 12 candle', 1.5, sweepAt(i) || sweepAt(i - 1) || sweepAt(i - 2), 'stop hunt lalu harga kembali ke dalam range');
+  let dh = -Infinity, dl = Infinity; for (let j = i; j >= 0 && X.t - ex[j].t <= 864e5; j--) { if (ex[j].h > dh) dh = ex[j].h; if (ex[j].l < dl) dl = ex[j].l; }
+  const pos = (X.c - dl) / (dh - dl || 1), inZone = dir > 0 ? pos < 0.5 : pos > 0.5, deep = dir > 0 ? pos < 0.25 : pos > 0.75;
+  add(dir > 0 ? 'Zona diskon range 24 jam' : 'Zona premium range 24 jam', deep ? 1.5 : 1, inZone, `${(pos * 100).toFixed(0)}% dari range`);
+  const fv = fvgNear(ex, i, dir, atr); add(dir > 0 ? 'FVG bullish sebagai support' : 'FVG bearish sebagai resistance', 1, !!fv, fv ? `${fmt(fv.lo)} sampai ${fmt(fv.hi)}` : 'tidak ada');
+  const ob = orderBlocks(ex.slice(Math.max(0, i - 199), i + 1)).find(o => o.dir === dir && X.c <= o.hi + 0.5 * atr && X.c >= o.lo - 0.5 * atr); add(dir > 0 ? 'Order block bullish' : 'Order block bearish', 1, !!ob, ob ? `${fmt(ob.lo)} sampai ${fmt(ob.hi)}` : 'tidak ada');
+  add('Kelelahan momentum (RSI 14)', 1, [i, i - 1, i - 2].some(j => (dir > 0 ? ex[j].rsi < 35 : ex[j].rsi > 65)), `RSI ${X.rsi.toFixed(0)}`);
+  const pv = ex[i - 1]; add('Reclaim EMA 21 searah bias', 0.5, dir > 0 ? X.c > X.ema && pv.c <= (pv.ema ?? pv.c) : X.c < X.ema && pv.c >= (pv.ema ?? pv.c), 'harga menembus EMA 21');
+  let aS = 0, aN = 0; for (let j = i - 100; j < i; j++) if (j >= 0 && ex[j].atr) { aS += ex[j].atr; aN++; } add('Ekspansi volatilitas (ATR)', 0.5, aN > 0 && X.atr >= aS / aN, `ATR ${(X.atr / pip).toFixed(1)} pips`);
+  const sl = clamp(dir > 0 ? X.c - (X.l - pip) : X.h + pip - X.c, 10 * pip, 50 * pip), lv = levelsAt(ex, h4, i, T);
+  const cand = lv.filter(l => (dir > 0 ? l.p > X.c + 1.2 * sl : l.p < X.c - 1.2 * sl) && Math.abs(l.p - X.c) <= 6 * sl).sort((a, b) => Math.abs(a.p - X.c) - Math.abs(b.p - X.c));
+  if (!cand.length) return { s, items, none: true, X, sl, pip };
+  const tp1 = cand[0], tp2 = cand.find(l => Math.abs(l.p - X.c) > Math.abs(tp1.p - X.c) + 0.6 * atr), clus = cand.filter(l => Math.abs(l.p - tp1.p) <= 0.6 * atr).length >= 2;
+  add('Konfluensi level likuiditas pada target', 1, clus, clus ? 'dua level atau lebih berdekatan' : 'satu level');
+  return { s, items, sl, tp1, tp2, rr: Math.abs(tp1.p - X.c) / sl, X, pip, atr };
+}
+const wilsonLb = (w, l) => { const n = w + l, wr = n ? w / n : 0, z = 1.96; return { wr, lb: n ? (wr + (z * z) / (2 * n) - z * Math.sqrt((wr * (1 - wr) + (z * z) / (4 * n)) / n)) / (1 + (z * z) / n) : 0 }; };
+function summT(a) { const w = a.filter(x => x.k === 'w').length, l = a.filter(x => x.k === 'l').length, rs = a.map(x => x.r), gp = rs.filter(r => r > 0).reduce((s, r) => s + r, 0), gl = -rs.filter(r => r < 0).reduce((s, r) => s + r, 0); return { n: a.length, w, l, ...wilsonLb(w, l), avgR: a.length ? mean(rs) : 0, pf: gl ? gp / gl : gp ? 99 : 0 }; }
+/* ===== Alur eksekusi berbasis sebab-akibat harga: POI Higher Timeframe, killzone sesi, tap, pergeseran struktur (MSS), konfirmasi close M5 ===== */
+const SESS = [[120, 300, 'London'], [420, 660, 'New York']];
+const sessOf = m => SESS.find(s => m > s[0] && m <= s[1]);
+function tpoProfile(cs, bins = 48) {
+  let lo = Infinity, hi = -Infinity; for (const k of cs) { if (k.l < lo) lo = k.l; if (k.h > hi) hi = k.h; }
+  const step = (hi - lo) / bins || 1e-9, w = new Array(bins).fill(0);
+  for (const k of cs) { const a = Math.max(0, Math.floor((k.l - lo) / step)), b = Math.min(bins - 1, Math.floor((k.h - lo) / step)), vol = k.v > 1 ? k.v : 1; for (let i = a; i <= b; i++) w[i] += vol / (b - a + 1); }
+  let poc = 0; for (let i = 1; i < bins; i++) if (w[i] > w[poc]) poc = i;
+  const tot = w.reduce((s, x) => s + x, 0); let acc = w[poc], l = poc, r = poc;
+  while (acc < 0.7 * tot && (l > 0 || r < bins - 1)) { const up = r < bins - 1 ? w[r + 1] : -1, dn = l > 0 ? w[l - 1] : -1; if (up >= dn) { r++; acc += w[r]; } else { l--; acc += w[l]; } }
+  return { poc: lo + (poc + 0.5) * step, vah: lo + (r + 1) * step, val: lo + l * step };
+}
+/* POI Higher Timeframe: klaster objek H4 (MA19 dan MA200, FVG, order block, VAL atau VAH, likuiditas sesi dan hari sebelumnya) di sisi diskon untuk BUY atau premium untuk SELL */
+function findPOI(h4, ex, i, dir, T) {
+  const X = ex[i], px = X.c; let m = h4.length; while (m > 0 && h4[m - 1].t + 144e5 > T) m--; if (m < 60) return null;
+  const hs = h4.slice(Math.max(0, m - 300), m), closes = hs.map(c => c.c), aH = mean(hs.slice(-14).map((c, j, a) => (j ? Math.max(c.h - c.l, Math.abs(c.h - a[j - 1].c), Math.abs(c.l - a[j - 1].c)) : c.h - c.l)).slice(1)) || px * 0.003;
+  const objs = [], add = (lo, hi, label) => { if (Number.isFinite(lo) && Number.isFinite(hi)) objs.push({ lo: Math.min(lo, hi), hi: Math.max(lo, hi), label }); };
+  const ma19 = ema(closes.slice(-200), 19); add(ma19 - 0.15 * aH, ma19 + 0.15 * aH, 'MA 19 H4'); if (closes.length >= 200) { const ma200 = sma(closes, 200); add(ma200 - 0.15 * aH, ma200 + 0.15 * aH, 'MA 200 H4'); }
+  for (let j = hs.length - 1; j >= 2 && j > hs.length - 80; j--) { const a = hs[j - 2], b = hs[j]; if (dir > 0 && b.l > a.h && hs.slice(j + 1).every(k => k.c > a.h)) add(a.h, b.l, 'FVG bullish H4'); if (dir < 0 && b.h < a.l && hs.slice(j + 1).every(k => k.c < a.l)) add(b.h, a.l, 'FVG bearish H4'); }
+  orderBlocks(hs.slice(-200)).filter(o => o.dir === dir).forEach(o => add(o.lo, o.hi, dir > 0 ? 'Order block bullish H4' : 'Order block bearish H4'));
+  levelsAt(ex, h4, i, T).forEach(l => { if (dir > 0 ? /low/i.test(l.label) : /high/i.test(l.label)) add(l.p - 0.05 * aH, l.p + 0.05 * aH, l.label); });
+  const per = ex.length > 1 ? ex[1].t - ex[0].t : 3e5, tp = tpoProfile(ex.slice(Math.max(0, i - Math.round(864e5 / per)), i + 1)), lv = dir > 0 ? tp.val : tp.vah; add(lv - 0.05 * aH, lv + 0.05 * aH, dir > 0 ? 'VAL profil 24 jam' : 'VAH profil 24 jam');
+  const side = objs.filter(o => (dir > 0 ? o.lo <= px + 0.2 * aH : o.hi >= px - 0.2 * aH) && Math.abs((dir > 0 ? o.hi : o.lo) - px) <= 2.5 * aH); if (!side.length) return null;
+  let best = null;
+  for (const o of side) { const cl = side.filter(x => x.lo <= o.hi + 0.3 * aH && x.hi >= o.lo - 0.3 * aH), lo = Math.min(...cl.map(x => x.lo)), hi = Math.max(...cl.map(x => x.hi)), labels = [...new Set(cl.map(x => x.label))], sc = labels.length * 10 - Math.abs((dir > 0 ? hi : lo) - px) / aH; if (!best || sc > best.sc) best = { lo, hi, labels, n: labels.length, sc, aH }; }
+  return best;
+}
+/* Memindai candle dari awal jendela sesi: tap pada POI, lalu MSS (close menembus swing lawan yang membawa harga ke POI) */
+function flowScan(ex, i, dir, poi, iW) {
+  let tap = -1; for (let j = iW; j <= i; j++) if (dir > 0 ? ex[j].l <= poi.hi : ex[j].h >= poi.lo) { tap = j; break; }
+  if (tap < 0) return { st: 'wait-tap' };
+  let ref = dir > 0 ? -Infinity : Infinity; for (let j = Math.max(0, tap - 5); j <= tap; j++) ref = dir > 0 ? Math.max(ref, ex[j].h) : Math.min(ref, ex[j].l);
+  let mss = -1; for (let j = tap + 1; j <= i; j++) if (dir > 0 ? ex[j].c > ref : ex[j].c < ref) { mss = j; break; }
+  let ext = dir > 0 ? Infinity : -Infinity; for (let j = tap; j <= (mss < 0 ? i : mss); j++) ext = dir > 0 ? Math.min(ext, ex[j].l) : Math.max(ext, ex[j].h);
+  if (mss < 0) return { st: 'wait-mss', tap, ref, ext };
+  const k = ex[mss], strong = (dir > 0 ? k.c > k.o : k.c < k.o) && Math.abs(k.c - k.o) >= 0.35 * (k.h - k.l);
+  return { st: strong ? 'mss-ok' : 'mss-weak', tap, ref, mss, ext, entry: k.c };
+}
+/* Risiko: SL di invalidasi (paku harga terakhir sebelum MSS) maksimal 50 pips, TP di likuiditas terdekat dengan R:R minimal 1:2 */
+function setupRisk(ex, h4, idx, dir, ext, entry, T) {
+  const pip = pipOf(cfg.symbol, entry), sl = Math.max(8 * pip, Math.abs(entry - ext) + pip);
+  if (sl > 50 * pip) return { bad: `invalidasi struktur ${(sl / pip).toFixed(0)} pips melebihi batas 50 pips` };
+  const cand = levelsAt(ex, h4, idx, T).filter(l => (dir > 0 ? l.p > entry + 2 * sl : l.p < entry - 2 * sl) && Math.abs(l.p - entry) <= 8 * sl).sort((a, b) => Math.abs(a.p - entry) - Math.abs(b.p - entry));
+  if (!cand.length) return { bad: 'belum ada target likuiditas dengan R:R minimal 1:2' };
+  return { sl, pip, tp1: cand[0], tp2: cand.find(l => Math.abs(l.p - entry) > Math.abs(cand[0].p - entry) + 0.5 * sl), rr: Math.abs(cand[0].p - entry) / sl };
+}
+/* Uji historis alur yang sama persis dengan sinyal langsung, satu setup maksimal per sesi per hari, hasil dihitung sampai 3 jam setelah entry */
+function runBacktest() {
+  const c = S.ctx, ex = c.ex, h4 = getH4(), ms = TF[cfg.exec], trades = []; indicFrom(ex, 1); let last = null;
+  for (let i = 300; i < ex.length - 3; i++) {
+    const X = ex[i], mins = (X.nh * 60 + X.nm + ms / 6e4) % 1440, ss = sessOf(mins); if (!ss) continue;
+    if (/Sat|Sun/.test(X.wd) && !isCrypto()) continue;
+    const key = `${X.td}|${ss[2]}`; if (key === last) continue; last = key;
+    const T0 = X.t + ms, B = h4Bias(h4, T0); if (!B.b) continue; const dir = B.b, iW = i, poi = findPOI(h4, ex, iW, dir, T0); if (!poi) continue;
+    let j = iW; for (; j < ex.length - 3; j++) { const mj = (ex[j].nh * 60 + ex[j].nm + ms / 6e4) % 1440, sj = sessOf(mj); if (!sj || sj[2] !== ss[2] || ex[j].td !== X.td) break; const f = flowScan(ex, j, dir, poi, iW); if (f.st === 'mss-ok' && f.mss === j) {
+      const T = ex[j].t + ms, R = setupRisk(ex, h4, j, dir, f.ext, f.entry, T); if (R.bad) break;
+      const F = factorsAt(ex, h4, j, dir, B, T), sp = f.entry - dir * R.sl, tp = R.tp1.p; let r = null, k = 't';
+      for (let q = j + 1; q < ex.length && ex[q].t < T + 108e5; q++) { const e = ex[q], hs = dir > 0 ? e.l <= sp : e.h >= sp, ht = dir > 0 ? e.h >= tp : e.l <= tp; if (hs) { r = -1; k = 'l'; break; } if (ht) { r = R.rr; k = 'w'; break; } r = clamp(((e.c - f.entry) * dir) / R.sl, -1, R.rr); }
+      if (r !== null) trades.push({ s: F.s, r, k, d: dir }); break; } }
+  }
+  return trades;
+}
+function nextWindow(now) {
+  const b = nyp(now);
+  for (let d = 0; d < 8; d++) { const n0 = nyp(Date.UTC(b.y, b.mo - 1, b.d + d, 12, 0)); if (!isCrypto() && /Sat|Sun/.test(n0.wd)) continue; for (const [s0, , nm] of SESS) { const t = nyToUtc(n0.y, n0.mo, n0.d, Math.floor(s0 / 60), s0 % 60); if (t > now) return { t, name: nm }; } }
+  return null;
+}
+
+function calibrate(tr) {
+  const all = summT(tr), table = [4, 5, 6, 7, 8].map(t => ({ t, ...summT(tr.filter(x => x.s >= t)) })); let thr = null;
+  for (let t = 4; t <= 9; t += 0.5) { const s = summT(tr.filter(x => x.s >= t)); if (s.n >= 15 && s.lb >= 0.5 && s.avgR > 0) { thr = { t, ...s }; break; } }
+  return { all, table, thr };
+}
+const statTxt = s => `${s.n} sampel, win-rate ${(s.wr * 100).toFixed(0)}% (batas bawah ${(s.lb * 100).toFixed(0)}%), rata-rata ${s.avgR.toFixed(2)}R, profit factor ${s.pf.toFixed(2)}`;
+/* Lapisan eksternal gratis: posisi COT (CFTC) dan gamma exposure opsi (Deribit, khusus BTC dan ETH). Gagal diambil berarti lapisan ditandai tidak tersedia, bukan ditebak. */
+const COTMAP = { EURUSD: ['099741', 1], GBPUSD: ['096742', 1], USDJPY: ['097741', -1], AUDUSD: ['232741', 1], USDCAD: ['090741', -1], USDCHF: ['092741', -1], NZDUSD: ['112741', 1], XAUUSD: ['088691', 1], XAGUSD: ['084691', 1], BTCUSD: ['133741', 1], US500: ['13874A', 1], US100: ['209742', 1], USOIL: ['067651', 1] };
+const symKey = () => { const s = String(cfg.symbol).replace(/^frx|^cry/, '').replace(/[^A-Za-z_]/g, '').toUpperCase(); return { OTC_NDX: 'US100', NDX: 'US100', OTC_SPC: 'US500', SPX: 'US500' }[s] || s.replace('_', ''); };
+async function fetchCOT() {
+  const m = COTMAP[symKey()]; if (!m) { S.cot = null; return; }
+  const r = await fetch(`https://publicreporting.cftc.gov/resource/6dca-aqww.json?cftc_contract_market_code=${m[0]}&$order=report_date_as_yyyy_mm_dd%20DESC&$limit=60`, { cache: 'no-store' }); if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const j = await r.json(), net = j.map(x => +x.noncomm_positions_long_all - +x.noncomm_positions_short_all).filter(Number.isFinite); if (net.length < 12) throw new Error('data COT kurang');
+  const hist = net.slice(0, 52), z = (net[0] - mean(hist)) / (std(hist) || 1), chg = net[0] - net[Math.min(3, net.length - 1)];
+  S.cot = { net: net[0], z, chg, date: String(j[0].report_date_as_yyyy_mm_dd).slice(0, 10), dir: sgn(chg) * m[1], sign: m[1] };
+}
+const MON = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
+async function fetchGEX() {
+  const k = symKey(), cur = k === 'BTCUSD' ? 'BTC' : k === 'ETHUSD' ? 'ETH' : null; if (!cur) { S.gex = null; return; }
+  const r = await fetch(`https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=${cur}&kind=option`, { cache: 'no-store' }); if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const rows = (await r.json()).result || [], now = Date.now(), byK = new Map(); let spot = 0;
+  for (const o of rows) {
+    const m = /^[A-Z]+-(\d{1,2})([A-Z]{3})(\d{2})-(\d+)-([CP])$/.exec(o.instrument_name); if (!m || !o.mark_iv || !o.open_interest) continue;
+    const T = (Date.UTC(2000 + +m[3], MON[m[2]], +m[1], 8) - now) / (365 * 864e5); if (!(T > 0) || T > 30 / 365) continue;
+    const K = +m[4], S0 = o.underlying_price, sg = o.mark_iv / 100, d1 = (Math.log(S0 / K) + 0.5 * sg * sg * T) / (sg * Math.sqrt(T)), gm = Math.exp(-0.5 * d1 * d1) / Math.sqrt(2 * Math.PI) / (S0 * sg * Math.sqrt(T)); spot = S0;
+    byK.set(K, (byK.get(K) || 0) + o.open_interest * gm * S0 * S0 * 0.01 * (m[5] === 'C' ? 1 : -1));
+  }
+  const ks = [...byK.keys()].sort((a, b) => a - b); if (ks.length < 5) throw new Error('data opsi kurang');
+  let cum = 0, flip = null; for (const q of ks) { const pr = cum; cum += byK.get(q); if (pr < 0 && cum >= 0 && flip === null) flip = q; }
+  const near = ks.filter(q => Math.abs(q - spot) / spot < 0.15), cw = near.filter(q => q >= spot).sort((a, b) => byK.get(b) - byK.get(a))[0], pw = near.filter(q => q <= spot).sort((a, b) => byK.get(a) - byK.get(b))[0];
+  S.gex = { net: ks.reduce((s, q) => s + byK.get(q), 0), spot, flip, t: Date.now(), levels: [cw && { p: cw, label: 'GEX call wall (Deribit)' }, pw && { p: pw, label: 'GEX put wall (Deribit)' }, flip && { p: flip, label: 'GEX gamma flip (Deribit)' }].filter(Boolean) };
+}
+function extPull() { S.cot = S.cot || null; fetchCOT().then(() => { S.cotErr = ''; }).catch(e => { S.cot = null; S.cotErr = e.message; }); fetchGEX().then(() => { S.gexErr = ''; }).catch(e => { S.gex = null; S.gexErr = e.message; }); }
+/* Candle eksekusi dibentuk langsung dari tick sehingga penutupan M5 terdeteksi saat itu juga */
+function exFeed(price, tMs) {
+  const c = S.ctx; if (!c.ready || !c.ex.length) return; const ms = TF[cfg.exec], l = c.ex[c.ex.length - 1]; if (tMs < l.t) return;
+  const t0 = l.t + Math.floor((tMs - l.t) / ms) * ms;
+  if (t0 > l.t) { const k = { t: t0, o: price, h: price, l: price, c: price, v: 1 }; annotate([k]); c.ex.push(k); if (c.ex.length > 22000) c.ex.shift(); indicFrom(c.ex, c.ex.length - 2); S.sigT = 0; }
+  else { l.c = price; if (price > l.h) l.h = price; if (price < l.l) l.l = price; l.v++; }
+}
+/* ===== Matriks konfluensi terpadu: model kuantitatif dan struktural saling memvalidasi menjadi satu skor arah ===== */
+function rsiArr(cs) {
+  const out = new Array(cs.length).fill(50); let ag = 0, al = 0;
+  for (let i = 1; i < cs.length; i++) { const d = cs[i].c - cs[i - 1].c, u = Math.max(d, 0), v = Math.max(-d, 0); if (i <= 14) { ag += u / 14; al += v / 14; } else { ag = (ag * 13 + u) / 14; al = (al * 13 + v) / 14; } out[i] = al ? 100 - 100 / (1 + ag / al) : 100; }
+  return out;
+}
+function llrT(ly, t, w = 24) {
+  const n = Math.min(w, t + 1), xs = [], ys = []; for (let i = 0; i < n; i++) { xs.push(i); ys.push(ly[t - n + 1 + i]); }
+  const mx = mean(xs), my = mean(ys); let sxx = 0, sxy = 0; for (let i = 0; i < n; i++) { sxx += (xs[i] - mx) ** 2; sxy += (xs[i] - mx) * (ys[i] - my); }
+  const b = sxy / (sxx || 1), a = my - b * mx; let sse = 0; for (let i = 0; i < n; i++) sse += (ys[i] - (a + b * xs[i])) ** 2;
+  const se = Math.sqrt(sse / Math.max(1, n - 2) / (sxx || 1)); return se ? b / se : 0;
+}
+function hurstW(ly, t, w = 120) {
+  const pts = []; for (const k of [1, 2, 4, 8, 16]) { const d = []; for (let i = Math.max(k, t - w + 1 + k); i <= t; i++) d.push(ly[i] - ly[i - k]); if (d.length > 8) pts.push([Math.log(k), Math.log(std(d) ** 2 || 1e-12)]); }
+  if (pts.length < 3) return 0.5; const mx = mean(pts.map(p => p[0])), my = mean(pts.map(p => p[1]));
+  return clamp(pts.reduce((s, p) => s + (p[0] - mx) * (p[1] - my), 0) / pts.reduce((s, p) => s + (p[0] - mx) ** 2, 0) / 2, 0, 1);
+}
+/* Model yang hanya memakai data sampai indeks t (kausal): dipakai sama persis oleh uji historis dan matriks langsung */
+function causalVotes(M, cs, t, rsi) {
+  const sig = Math.sqrt(M.hv[t]) || 1e-9, tz = (M.kal.slope[t] * Math.sqrt(24)) / sig, ly = M.ly, rows = [], px = cs[t].c;
+  const ts = mean([12, 48, 168].filter(L => L < t).map(L => Math.tanh((ly[t] - ly[t - L]) / (sig * Math.sqrt(L)) / 1.5)));
+  const w20 = cs.slice(Math.max(0, t - 19), t + 1).map(c => c.c), zmr = (px - mean(w20)) / (std(w20) || 1), hr = hurstW(ly, t);
+  const hs = M.hv.slice(Math.max(0, t - 249), t + 1).map(Math.sqrt).sort((a, b) => a - b), vr = sig / (hs[hs.length >> 1] || sig);
+  const tpo = tpoProfile(cs.slice(Math.max(0, t - 95), t + 1)), atr = mean(cs.slice(Math.max(0, t - 14), t + 1).map(c => c.h - c.l)) || px * 0.001;
+  const win = cs.slice(Math.max(0, t - 49), t + 1), hi = Math.max(...win.map(c => c.h)), lo = Math.min(...win.map(c => c.l)), pos = (px - lo) / (hi - lo || 1), tl = llrT(ly, t), trendSign = Math.sign(tz) || Math.sign(ts);
+  rows.push({ k: 'Filter Kalman (tren murni)', v: Math.tanh(tz), w: 1.2, note: `z ${tz.toFixed(2)}`, sub: true });
+  rows.push({ k: 'Regresi linier lokal 24 candle', v: Math.tanh(tl / 2.5), w: 0.8, note: `t-stat ${tl.toFixed(1)}`, sub: true });
+  rows.push({ k: 'Momentum deret waktu', v: ts, w: 1, note: ts.toFixed(2), sub: true });
+  rows.push({ k: 'Rezim volatilitas GARCH', v: vr > 1.25 ? 0.5 * trendSign : vr < 0.8 ? -0.5 * Math.sign(zmr) : 0, w: 0.6, note: vr > 1.25 ? 'ekspansi, ikuti tren' : vr < 0.8 ? 'kompresi, cenderung berbalik' : 'normal', sub: true });
+  rows.push({ k: 'Eksponen Hurst', v: hr > 0.55 ? 0.5 * trendSign : hr < 0.45 ? -0.5 * Math.sign(zmr) : 0, w: 0.6, note: `H ${hr.toFixed(2)} ${hr > 0.55 ? 'tren persisten' : hr < 0.45 ? 'berbalik' : 'acak, tidak ada edge'}`, sub: true });
+  rows.push({ k: 'Profil harga-waktu (POC, VAH, VAL)', v: px > tpo.vah ? (px - tpo.vah > 2 * atr ? -0.3 : 0.5) : px < tpo.val ? (tpo.val - px > 2 * atr ? 0.3 : -0.5) : 0.4 * Math.sign(tpo.poc - px), w: 0.8, note: `POC ${fmt(tpo.poc)}, VAH ${fmt(tpo.vah)}, VAL ${fmt(tpo.val)}`, sub: true });
+  rows.push({ k: 'Zona diskon dan premium (50 candle)', v: clamp((0.5 - pos) * 2, -1, 1), w: 0.8, note: `${(pos * 100).toFixed(0)}% dari range`, sub: true });
+  rows.push({ k: 'Kelelahan momentum (RSI 14)', v: rsi ? clamp((50 - rsi[t]) / 25, -1, 1) : 0, w: 0.6, note: rsi ? `RSI ${rsi[t].toFixed(0)}` : '-', sub: true });
+  rows.push({ k: 'Mean reversion (z-score 20)', v: -Math.tanh(zmr / 2) * 0.6, w: 0.5, note: `z ${zmr.toFixed(2)}`, sub: true });
+  return rows;
+}
+const compOf = rows => { const ws = rows.reduce((s, r) => s + (r.w || 0), 0); return ws ? rows.reduce((s, r) => s + r.v * (r.w || 0), 0) / ws : 0; };
+/* Walk-forward kausal pada seluruh riwayat: seberapa sering tanda skor komposit benar menebak arah H candle ke depan, per kekuatan skor */
+function compBacktest(M, cs, H) {
+  const rsi = rsiArr(cs), out = [];
+  for (let t = 200; t < cs.length - H - 1; t += 3) { const c = compOf(causalVotes(M, cs, t, rsi)), y = M.ly[t + H] - M.ly[t]; if (y !== 0) out.push({ c, ok: Math.sign(c) === Math.sign(y) }); }
+  const sum = a => { const w = a.filter(x => x.ok).length; return { n: a.length, ...wilsonLb(w, a.length - w) }; };
+  const bins = [[0.05, 0.12], [0.12, 0.2], [0.2, 0.3], [0.3, 2]].map(([a, b]) => ({ a, b, ...sum(out.filter(x => Math.abs(x.c) >= a && Math.abs(x.c) < b)) }));
+  return { ...sum(out.filter(x => Math.abs(x.c) >= 0.05)), bins };
+}
+function calProb(sub, cb) {
+  if (!cb || !cb.n || Math.abs(sub) < 0.05) return null;
+  const a = Math.abs(sub), bin = cb.bins.find(b => a >= b.a && a < b.b), u = bin && bin.n >= 25 ? bin : cb, hit = u.wr;
+  return { up: sub >= 0 ? hit : 1 - hit, hit, lb: u.lb, n: u.n, scope: u === cb ? 'semua skor' : `skor ${(u.a * 100).toFixed(0)} sampai ${u.b >= 2 ? '100' : (u.b * 100).toFixed(0)}` };
+}
+/* Matriks waktu-harga: arah rata-rata per jam New York dari riwayat eksekusi, dipakai hanya bila signifikan secara statistik */
+function hourlyVote(ex, now) {
+  if (!ex || ex.length < 2000) return null; const h = nyp(now).h, key = `${ex.length}|${h}`;
+  if (S.hrKey !== key) { let s = 0, q = 0, n = 0; for (let i = 1; i < ex.length; i++) { if (ex[i].nh !== h) continue; const r = Math.log(ex[i].c / ex[i - 1].c); if (Number.isFinite(r)) { s += r; q += r * r; n++; } } const m = n ? s / n : 0, sd = Math.sqrt(Math.max(1e-18, (n ? q / n : 0) - m * m)); S.hrKey = key; S.hrV = n >= 200 ? { h, n, z: m / (sd / Math.sqrt(n)) } : null; }
+  return S.hrV;
+}
+function htfZones(h4, px) {
+  const hs = h4.slice(-300); if (hs.length < 60) return { sup: 0, res: 0 }; const aH = mean(hs.slice(-14).map(k => k.h - k.l)) || px * 0.003; let sup = 0, res = 0;
+  for (let j = hs.length - 1; j >= 2 && j > hs.length - 80; j--) { const a = hs[j - 2], b = hs[j], af = hs.slice(j + 1); if (b.l > a.h && af.every(k => k.c > a.h) && a.h <= px + 0.3 * aH && a.h >= px - 1.5 * aH) sup++; if (b.h < a.l && af.every(k => k.c < a.l) && a.l >= px - 0.3 * aH && a.l <= px + 1.5 * aH) res++; }
+  orderBlocks(hs.slice(-200)).forEach(o => { if (o.dir > 0 && o.hi <= px + 0.3 * aH && o.hi >= px - 1.5 * aH) sup++; if (o.dir < 0 && o.lo >= px - 0.3 * aH && o.lo <= px + 1.5 * aH) res++; });
+  return { sup, res };
+}
+function buildMatrix(M, cs, q, t, g, fv, ap, base, H, px) {
+  const last = cs[cs.length - 1].t; if (!S.rsiC || S.rsiC.t !== last || S.rsiC.n !== cs.length) S.rsiC = { t: last, n: cs.length, a: rsiArr(cs) };
+  const rows = causalVotes(M, cs, M.n - 1, S.rsiC.a), c = S.ctx, h4 = getH4(), B = h4.length >= 60 ? h4Bias(h4, Date.now()) : null, atr = mean(cs.slice(-15).map(k => k.h - k.l)) || px * 0.001;
+  rows.push({ k: 'Bias H4 (CTC, struktur, MA19, tren)', v: B ? clamp(B.s / 4, -1, 1) : 0, w: B ? 1.6 : 0, note: B ? `skor ${B.s > 0 ? '+' : ''}${B.s} dari 4` : 'data H4 belum ada' });
+  rows.push({ k: 'Pola analog historis', v: ap ? Math.tanh((1.5 * ap.dm[H]) / Math.sqrt(base.vp[H - 1])) : 0, w: ap ? 1.2 : 0, note: ap ? `${S.anSet.n} pola termirip` : 'riwayat terlalu pendek' });
+  rows.push({ k: 'TTFM (fraktal C1, C2, C3)', v: clamp(t.score / 100, -1, 1), w: 1, note: t.seq });
+  rows.push({ k: 'GXT (struktur, SMT, FVG, zona)', v: clamp(g.score / 100, -1, 1), w: 1, note: g.zone });
+  const z = htfZones(h4, px), sup = fv.filter(f => f.dir > 0 && f.hi <= px + 0.3 * atr && f.hi >= px - 1.5 * atr).length + g.obs.filter(o => o.dir > 0 && o.hi <= px + 0.3 * atr && o.hi >= px - 1.5 * atr).length, res = fv.filter(f => f.dir < 0 && f.lo >= px - 0.3 * atr && f.lo <= px + 1.5 * atr).length + g.obs.filter(o => o.dir < 0 && o.lo >= px - 0.3 * atr && o.lo <= px + 1.5 * atr).length;
+  rows.push({ k: 'Order block dan FVG multi-timeframe', v: clamp((sup + z.sup - res - z.res) / 3, -1, 1), w: 0.9, note: `${sup + z.sup} penyangga, ${res + z.res} penahan (${TFN[cfg.tf]} dan H4)` });
+  rows.push({ k: 'Likuiditas eksternal dan internal, sapuan', v: g.sw || 0, w: 0.9, note: g.sweep });
+  rows.push({ k: 'Divergensi SMT', v: g.smtv || 0, w: g.smtv ? 0.8 : 0, note: g.smt });
+  if (S.gex) rows.push({ k: 'Eksposur gamma (GEX opsi)', v: S.gex.net < 0 ? 0.5 * Math.sign(q.trendZ) : -0.4 * Math.sign(q.zmr), w: 0.6, note: S.gex.net < 0 ? 'gamma negatif, gerak membesar' : 'gamma positif, harga tertahan' });
+  else rows.push({ k: 'Eksposur gamma (GEX opsi)', v: 0, w: 0, note: ['BTCUSD', 'ETHUSD'].includes(symKey()) ? (S.gexErr || 'memuat') : 'hanya tersedia untuk BTC dan ETH' });
+  rows.push(S.cot ? { k: 'Posisi COT (CFTC)', v: S.cot.dir * (Math.abs(S.cot.z) > 1.5 ? 0.3 : 0.6), w: 0.5, note: `laporan ${S.cot.date}, z ${S.cot.z.toFixed(1)}` } : { k: 'Posisi COT (CFTC)', v: 0, w: 0, note: S.cotErr || 'tidak ada kontrak untuk instrumen ini' });
+  const hv = c.ready ? hourlyVote(c.ex, Date.now()) : null;
+  rows.push(hv ? { k: 'Matriks waktu-harga (jam New York)', v: Math.abs(hv.z) < 1.5 ? 0 : clamp(hv.z / 3, -1, 1), w: 0.4, note: `jam ${hv.h}.00 ET, z ${hv.z.toFixed(1)}, ${hv.n} candle${Math.abs(hv.z) < 1.5 ? ', tidak signifikan' : ''}` } : { k: 'Matriks waktu-harga (jam New York)', v: 0, w: 0, note: 'menunggu riwayat eksekusi' });
+  const act = rows.filter(r => r.w > 0), comp = compOf(rows), sub = compOf(rows.filter(r => r.sub));
+  return { rows, comp, sub, n: act.length, agree: act.filter(r => r.v && Math.sign(r.v) === Math.sign(comp)).length };
+}
+/* Bentuk jalur median dan envelope. Median adalah titik temu bobot konfluensi menuju target struktural; envelope probabilitas dikunci oleh likuiditas Higher Timeframe. */
+function structShape(tg, mx, fc0, H) {
+  const P0 = fc0.P0, lnT = Math.log(tg.price / P0), dirT = sgn(lnT); if (!dirT) return null;
+  const agree = sgn(mx.comp) * dirT, str = Math.min(1, Math.abs(mx.comp) / 0.4), wT = (agree > 0 ? 0.7 + 0.3 * str : agree === 0 ? 0.5 : 0.2) * clamp(tg.p / 0.4, 0.6, 1);
+  const K = clamp(Math.round(tg.k), 2, H), sm = x => { x = clamp(x, 0, 1); return x * x * x * (x * (6 * x - 15) + 10); };
+  const mu = fc0.mu.map((m0, k) => wT * lnT * sm((k + 1) / K) + (1 - wT) * m0), mult = 1 - 0.15 * wT, vK = fc0.vp[K - 1], vp = fc0.vp.map((v, k) => (k + 1 <= K ? v : vK + (v - vK) * 0.5) * mult);
+  const atr = tg.atr, objs = tg.objs || [], byD = (a, b) => Math.abs(a.p - P0) - Math.abs(b.p - P0);
+  const beyond = objs.filter(o => (dirT > 0 ? o.p > tg.price + 0.3 * atr && o.p <= tg.price + 3 * atr : o.p < tg.price - 0.3 * atr && o.p >= tg.price - 3 * atr)).sort(byD)[0];
+  const back = objs.filter(o => (dirT > 0 ? o.p < P0 - 0.3 * atr && o.p >= P0 - 3 * atr : o.p > P0 + 0.3 * atr && o.p <= P0 + 3 * atr)).sort(byD)[0];
+  let hi, lo;
+  if (dirT > 0) { hi = beyond ? beyond.p + 0.5 * atr : tg.price + 1.5 * atr; lo = back ? back.p - 0.5 * atr : P0 - 1.5 * atr; }
+  else { lo = beyond ? beyond.p - 0.5 * atr : tg.price - 1.5 * atr; hi = back ? back.p + 0.5 * atr : P0 + 1.5 * atr; }
+  hi = Math.max(hi, tg.price + 0.5 * atr, P0 + 0.5 * atr); lo = Math.min(lo, tg.price - 0.5 * atr, P0 - 0.5 * atr);
+  return { mu, vp, lo, hi, wT, K, why: `Median diarahkan ke ${fmt(tg.price)} (${tg.labels.slice(0, 3).join(', ')}) dalam sekitar ${K} candle, bobot target ${(wT * 100).toFixed(0)}% dari konfluensi ${mx.agree} dari ${mx.n} model${agree < 0 ? ' (arah target berlawanan dengan skor matriks, bobot dipangkas)' : ''}. Envelope probabilitas dikunci di ${fmt(lo)} sampai ${fmt(hi)}, yaitu likuiditas terdekat di luar target dan level invalidasi.` };
+}
+/* ===== Sinyal eksekusi langsung: bias H4, killzone, tap POI, MSS, close candle eksekusi. Aturan yang sama diuji pada riwayat. ===== */
+function evalSignal() {
+  const c = S.ctx, EXN = TFN[cfg.exec], out = { state: 'loading', head: '', sub: '', side: 'none', items: [], ext: [], stat: '', steps: [], risk: null };
+  if (!c.ready) { out.head = c.err || `Mengumpulkan riwayat ${EXN} dan H4 dari sumber data untuk uji historis (${c.ex.length} candle ${EXN}, ${c.h4.length} candle H4).`; return out; }
+  const ex = c.ex, h4 = getH4(), ms = TF[cfg.exec], now = Date.now(), n = ex.length, px = liveP(), pip = pipOf(cfg.symbol, px), cur = ex[n - 1]; indicFrom(ex, n - 2);
+  const stale = now - (cur.t + ms), gap = Math.abs(cur.c - px) / pip;
+  if ((stale > 3 * ms && !S.closed) || gap > 200) { if (now - (c.rf || 0) > 60000) { c.rf = now; ctxPull(false); } out.head = `Data ${EXN} sedang disegarkan (selisih ${gap.toFixed(0)} pips dari harga sekarang), sinyal ditunda agar tidak memakai level usang.`; return out; }
+  const B = h4Bias(h4, now), cal = c.cal, dir = B.b, SIDE = dir > 0 ? 'BUY' : 'SELL', col = dir > 0 ? 'HIJAU' : 'MERAH', thr = cal && cal.thr ? cal.thr.t : null;
+  out.bias = `Bias H4: ${dir > 0 ? 'BUY' : dir < 0 ? 'SELL' : 'netral'} (skor ${B.s > 0 ? '+' : ''}${B.s} dari 4). ${B.txt}`;
+  const days = Math.round((ex[n - 1].t - ex[0].t) / 864e5);
+  out.stat = cal ? (cal.all.n < 10 ? `Uji historis ${days} hari (${n} candle ${EXN}): hanya ${cal.all.n} setup yang lolos seluruh aturan (POI, tap, MSS, close ${EXN}, SL maksimal 50 pips, R:R minimal 1:2), terlalu sedikit untuk kesimpulan statistik, jadi tidak ada sinyal berstatus Valid. Ini bukan nasihat keuangan.` : `Uji historis ${days} hari (${n} candle ${EXN}), ${statTxt(cal.all)}. ${thr !== null ? `Ambang skor teruji: ${cal.thr.t} poin ke atas (${statTxt(cal.thr)}).` : 'Belum ada ambang skor yang lolos uji (minimal 15 sampel, batas bawah win-rate di atas 50%, rata-rata R positif), jadi tidak ada sinyal berstatus Valid. Ini bukan nasihat keuangan.'}`) : '';
+  const ev = NEWS.cal.find(e => e.cur === 'USD' && e.imp === 'High' && now > e.t - 15 * 6e4 && now < e.t + 20 * 6e4);
+  if (S.closed) { out.state = 'closed'; out.head = 'Pasar tutup. Sinyal dihitung ulang otomatis saat pasar buka dan sesi London atau New York berikutnya mulai.'; return out; }
+  if (ev) { out.state = 'blackout'; out.head = `Tunggu rilis ${ev.title} (${hh(ev.t)}). Tidak ada entry 15 menit sebelum sampai 20 menit sesudah rilis berdampak tinggi, karena lonjakan spread dan sapuan acak.`; return out; }
+  if (!dir) { out.state = 'neutral'; out.head = 'Bias H4 netral (kurang dari 3 dari 4 faktor searah). Tidak ada sinyal eksekusi.'; return out; }
+  out.side = dir > 0 ? 'buy' : 'sell';
+  const ext = []; if (S.cot) { const al = S.cot.dir === dir; ext.push({ k: `Posisi COT (CFTC, laporan ${S.cot.date})`, ok: al, w: 0.5, txt: `net spekulan ${Math.round(S.cot.net)} (z ${S.cot.z.toFixed(1)}), perubahan 4 minggu ${S.cot.chg > 0 ? 'naik' : 'turun'}${Math.abs(S.cot.z) > 1.5 ? ', ekstrem: waspada pembalikan' : ''}` }); } else ext.push({ k: 'Posisi COT (CFTC)', ok: null, txt: S.cotErr ? `gagal dimuat (${S.cotErr})` : 'tidak ada kontrak COT untuk instrumen ini' });
+  if (S.gex) { const near = S.gex.levels.find(l => Math.abs(l.p - px) / px < 0.003); ext.push({ k: 'Gamma exposure opsi (Deribit)', ok: S.gex.net < 0 ? true : null, w: 0, txt: `GEX bersih ${S.gex.net >= 0 ? 'positif (pasar cenderung tertahan)' : 'negatif (gerak cenderung membesar)'}${S.gex.flip ? `, gamma flip ${fmt(S.gex.flip)}` : ''}${near ? `, harga dekat ${near.label}` : ''}` }); } else if (['BTCUSD', 'ETHUSD'].includes(symKey())) ext.push({ k: 'Gamma exposure opsi (Deribit)', ok: null, txt: S.gexErr ? `gagal dimuat (${S.gexErr})` : 'memuat' });
+  ext.push({ k: 'Order flow, heatmap, order book (COB)', ok: null, txt: 'tidak tersedia dari sumber data gratis, tidak ditebak' }); out.ext = ext;
+  const ss = sessOf(nyMins(cur.t + ms)); let iW = n - 1; if (ss) while (iW > 0 && ex[iW - 1].td === cur.td && sessOf(nyMins(ex[iW - 1].t + ms)) === ss) iW--;
+  const poi = findPOI(h4, ex, ss ? iW : n - 1, dir, ss ? ex[iW].t + ms : now);
+  const mk = oks => { let seen = false; return ['Bias H4', 'Killzone', 'Tap POI', 'MSS', `Close ${EXN}`].map((k, i) => (oks[i] ? { k, s: 'ok' } : seen ? { k, s: 'no' } : ((seen = true), { k, s: 'now' }))); };
+  if (!poi) { out.state = 'wait'; out.steps = mk([true, !!ss, false, false, false]); out.head = `Bias H4 ${SIDE}, tetapi belum ada zona POI Higher Timeframe di sisi ${dir > 0 ? 'diskon' : 'premium'} dalam jarak wajar (maksimal 2,5 ATR H4). Tidak ada setup, jangan memaksa entry.`; return out; }
+  const poiTxt = `${fmt(poi.lo)} sampai ${fmt(poi.hi)} (${poi.labels.slice(0, 3).join(' + ')}${poi.labels.length > 3 ? ` + ${poi.labels.length - 3} lainnya` : ''})`, dPoi = (dir > 0 ? px - poi.hi : poi.lo - px) / pip;
+  out.items = [{ k: 'POI Higher Timeframe', ok: true, w: 0, txt: `${poiTxt}, ${poi.n} objek berkonfluensi` }];
+  const seq = dir > 0 ? 'di atas' : 'di bawah', trig = `close ${EXN} ${col}`;
+  if (!ss) {
+    const nw = nextWindow(now); out.state = 'plan'; out.steps = mk([true, false, false, false, false]);
+    out.head = `${nw ? `Rencana ${nw.name} (mulai ${hh(nw.t)}): ` : 'Rencana sesi berikutnya: '}harga ${fmt(px)} ${dPoi > 0 ? `berjarak ${dPoi.toFixed(0)} pips dari` : 'sudah berada di dalam atau melewati'} POI ${poiTxt}. ${SIDE} valid hanya jika harga menyentuh POI saat sesi berjalan, disusul MSS (candle ${EXN} menutup ${seq} ${dir > 0 ? 'high' : 'low'} terakhir), lalu ${trig}.`;
+    out.sub = `Bias H4 ${dir > 0 ? 'naik' : 'turun'}. SL di invalidasi struktur maksimal 50 pips dan TP di likuiditas dengan R:R minimal 1:2 dihitung saat MSS terjadi.`; return out;
+  }
+  const iC = n - 2, f = flowScan(ex, iC, dir, poi, iW), curTap = dir > 0 ? cur.l <= poi.hi : cur.h >= poi.lo, win = ss[2], lab = R => `SL ${fmt(R.entry - dir * R.sl)} (${(R.sl / R.pip).toFixed(0)} pips, invalidasi di paku harga ${fmt(R.ext)}), TP1 ${fmt(R.tp1.p)} (${R.tp1.label}), R:R 1:${R.rr.toFixed(1)}${R.tp2 ? `, TP2 ${fmt(R.tp2.p)} (${R.tp2.label})` : ''}.`;
+  if (f.st === 'wait-tap') {
+    out.state = 'wait'; out.steps = mk([true, true, false, false, false]);
+    out.head = curTap ? `Harga menyentuh POI ${poiTxt} pada candle ${EXN} ${hh(cur.t)} yang belum tertutup. Setelah candle ini tertutup, cari MSS: ${EXN} menutup ${seq} ${dir > 0 ? 'high' : 'low'} terdekat, lalu ${trig}.` : `${win} berjalan. Harga ${fmt(px)} masih ${dPoi.toFixed(0)} pips dari POI ${poiTxt}. ${SIDE} baru valid setelah POI tersentuh, MSS, dan ${trig}; sebelum itu tidak ada entry.`;
+    out.sub = `Bias H4 ${dir > 0 ? 'naik' : 'turun'}; diperbarui setiap tick dan setiap penutupan candle.`; return out;
+  }
+  if (f.st === 'wait-mss') {
+    const R = setupRisk(ex, h4, n - 1, dir, f.ext, f.ref, now), dRef = Math.abs(f.ref - px) / pip, pre = `POI tersentuh pukul ${hh(ex[f.tap].t)} (paku harga ${fmt(f.ext)}). `; out.steps = mk([true, true, true, false, false]);
+    if (R.bad) { out.state = 'wait'; out.head = `${pre}Jika MSS terjadi di ${fmt(f.ref)}, setup tetap gugur: ${R.bad}. Tidak ada entry.`; return out; }
+    R.entry = f.ref; R.ext = f.ext; out.state = 'setup'; out.risk = { entry: f.ref, sl: f.ref - dir * R.sl, slPips: R.sl / pip, tp1: R.tp1.p, tp1l: R.tp1.label, rr: R.rr, cond: true };
+    out.head = `${pre}Jika candle ${EXN} ${hh(cur.t)} menutup ${col} ${seq} ${fmt(f.ref)} (${dRef.toFixed(0)} pips dari harga), MSS terkonfirmasi dan pukul ${hh(cur.t + ms)} ${SIDE} instan zero floating. ${lab(R)}`;
+    const F = factorsAt(ex, h4, n - 1, dir, B, now); out.items = [...out.items, ...F.items]; out.sub = `Konfluensi ${F.s.toFixed(1)} dari 10,5 poin. ${thr !== null ? `Ambang teruji ${thr}.` : 'Belum ada ambang teruji, sinyal baru berstatus Setup.'}`; return out;
+  }
+  if (f.st === 'mss-weak') { out.state = 'wait'; out.steps = mk([true, true, true, true, false]); out.head = `MSS terjadi pukul ${hh(ex[f.mss].t)} tetapi candle penutupnya lemah (bukan ${col} penuh), sehingga tidak memenuhi konfirmasi ${EXN}. Tidak ada entry di sesi ${win} ini.`; return out; }
+  const T = ex[f.mss].t + ms, R = setupRisk(ex, h4, f.mss, dir, f.ext, f.entry, T), age = iC - f.mss; out.steps = mk([true, true, true, true, true]);
+  if (R.bad) { out.state = 'wait'; out.head = `MSS terkonfirmasi pukul ${hh(ex[f.mss].t)}, tetapi ${R.bad}. Tidak ada entry.`; return out; }
+  R.entry = f.entry; R.ext = f.ext; const F = factorsAt(ex, h4, f.mss, dir, B, T); out.items = [...out.items, ...F.items];
+  out.risk = { entry: f.entry, sl: f.entry - dir * R.sl, slPips: R.sl / pip, tp1: R.tp1.p, tp1l: R.tp1.label, rr: R.rr };
+  const fresh = age <= 1 && now < ex[f.mss].t + 3 * ms && Math.abs(px - f.entry) <= 0.5 * R.sl, okS = thr !== null && F.s >= thr;
+  const prob = cal && cal.thr ? `Peluang historis pada skor ${cal.thr.t}+: ${(cal.thr.wr * 100).toFixed(0)}% menang (batas bawah ${(cal.thr.lb * 100).toFixed(0)}%, ${cal.thr.n} sampel).` : '';
+  if (fresh) {
+    out.state = okS ? 'valid' : 'setup';
+    out.head = `${okS ? 'SINYAL AKTIF' : 'Setup terkonfirmasi'}: tap POI pukul ${hh(ex[f.tap].t)}, MSS, lalu candle ${EXN} ${hh(ex[f.mss].t)} menutup ${col}. ${SIDE} instan zero floating di ${fmt(f.entry)} (berlaku sampai ${hh(ex[f.mss].t + 3 * ms)}). ${lab(R)}`;
+    out.sub = `Konfluensi ${F.s.toFixed(1)} dari 10,5 poin, ${okS ? 'di atas ambang teruji.' : thr !== null ? `di bawah ambang teruji ${thr}, jangan entry.` : 'belum ada ambang teruji secara statistik, perlakukan sebagai Setup.'} ${prob}`;
+  } else { out.state = 'wait'; out.head = `MSS terkonfirmasi pukul ${hh(ex[f.mss].t)} dengan entry ideal ${fmt(f.entry)}, tetapi ${age > 1 ? `sudah lewat ${age} candle` : 'harga sudah bergeser lebih dari 0,5R'}. Jangan mengejar harga; tunggu setup berikutnya.`; out.risk = null; }
+  return out;
+}
+const PILL = { valid: 'Valid', setup: 'Setup', wait: 'Menunggu', plan: 'Rencana', blackout: 'Tunggu rilis', neutral: 'Netral', loading: 'Memuat', closed: 'Pasar tutup', error: 'Error' };
+function renderSummary() {
+  const A = S.an, sg = S.sig; if (!A || !sg) return; const pr = A.pr, r = sg.risk, d = A.mx.comp;
+  bind('sum.bias', `${A.label} ${d > 0 ? '+' : ''}${(d * 100).toFixed(0)}`); setDir('sum.bias', d);
+  bind('sum.prob', pr ? `${(Math.max(pr.up, 1 - pr.up) * 100).toFixed(0)}% ${pr.up >= 0.5 ? 'naik' : 'turun'}` : 'netral'); setDir('sum.prob', pr ? pr.up - 0.5 : 0);
+  bind('sum.state', `${PILL[sg.state] || sg.state}${sg.side === 'buy' ? ' BUY' : sg.side === 'sell' ? ' SELL' : ''}`);
+  bind('sum.target', A.tg ? `${fmt(A.tg.price)} (${(A.tg.p * 100).toFixed(0)}%)` : '-');
+  bind('sum.risk', r ? `${r.slPips.toFixed(0)} pips, R:R 1:${r.rr.toFixed(1)}` : '-');
+}
+function renderSignal() {
+  const now = Date.now(); if (now - (S.sigT || 0) < 400) return; S.sigT = now; let sg;
+  try { sg = evalSignal(); } catch (e) { console.error(e); sg = { state: 'error', head: `Sinyal gagal dihitung: ${e.message}`, sub: '', side: 'none', items: [], ext: [], stat: '', steps: [], risk: null }; }
+  S.sig = sg; const pill = $('#sig-pill'); if (!pill) return; pill.dataset.st = sg.state; pill.textContent = PILL[sg.state] || sg.state;
+  bind('insight.bias', sg.bias || '');
+  $('#triggers').innerHTML = `<li data-side="${sg.side}">${esc(sg.head)}${sg.sub ? `<small>${esc(sg.sub)}</small>` : ''}</li>`;
+  $('#sig-steps').innerHTML = (sg.steps || []).map(s => `<li data-s="${s.s}">${esc(s.k)}</li>`).join('');
+  const row = x => `<li data-ok="${x.ok === null || x.ok === undefined ? 'na' : x.ok ? 1 : 0}"><span>${esc(x.k)}${x.w ? ` <em>+${x.w}</em>` : ''}</span><small>${esc(x.txt || '')}</small></li>`;
+  $('#sig-factors').innerHTML = [...(sg.items || []), ...(sg.ext || [])].map(row).join('');
+  bind('insight.edge', sg.stat || ''); renderSummary();
+}
+function renderMatrix(A) {
+  const el = $('#mx-list'), mx = A.mx; if (!el || !mx) return;
+  el.innerHTML = mx.rows.map(r => `<li data-na="${r.w ? 0 : 1}"><span>${esc(r.k)}</span><i data-dir="${r.w ? dirOf(r.v) : 'flat'}" style="--w:${r.w ? Math.min(50, Math.abs(r.v) * 50).toFixed(1) : 0}%"></i><b>${r.w ? `${r.v > 0 ? '+' : ''}${(r.v * 100).toFixed(0)}` : '-'}</b><small>${esc(r.note || '')}</small></li>`).join('');
+  bind('mx.sum', `${mx.agree} dari ${mx.n} model searah ${mx.comp > 0 ? 'naik' : mx.comp < 0 ? 'turun' : 'netral'}`);
+  const pr = A.pr; bind('mx.cal', pr ? `Probabilitas arah dikalibrasi dari uji kausal ${pr.n} sampel (${pr.scope}): ${(pr.hit * 100).toFixed(0)}% benar, batas bawah ${(pr.lb * 100).toFixed(0)}%. Model struktural (OB, FVG, likuiditas, SMT, GEX, COT, TTFM, GXT) menggeser arah tetapi belum bisa diuji ulang tiap candle.` : 'Skor terlalu lemah atau riwayat terlalu pendek untuk kalibrasi probabilitas arah.');
+}
+
+/* Target proyeksi: konfluensi objek, wajib berada di dalam kerucut prakiraan dan di luar jarak minimum yang naik dengan akar horizon */
+function targets(cs, q, g, t, fv, fc, paths, H, score) {
+  const n = cs.length, P0 = fc.P0, closes = cs.map(c => c.c);
+  const atr = mean(cs.slice(-15).map((c, i, a) => (i ? Math.max(c.h - c.l, Math.abs(c.h - a[i - 1].c), Math.abs(c.l - a[i - 1].c)) : c.h - c.l)).slice(1)) || P0 * 0.001;
+  const objs = [], add = (p, kind, label) => { if (Number.isFinite(p) && p > 0) objs.push({ p, kind, label }); };
+  add(ema(closes.slice(-300), 19), 'ma', 'Moving Average 19'); if (n >= 200) add(sma(closes, 200), 'ma', 'Moving Average 200');
+  for (let i = Math.max(3, n - 300); i < n - 3; i++) {
+    let h = true, l = true; for (let j = 1; j <= 3; j++) { if (cs[i].h <= cs[i - j].h || cs[i].h <= cs[i + j].h) h = false; if (cs[i].l >= cs[i - j].l || cs[i].l >= cs[i + j].l) l = false; }
+    if (h && cs.slice(i + 4).every(k => k.h < cs[i].h)) add(cs[i].h, 'elp', 'External Liquidity Pool');
+    if (l && cs.slice(i + 4).every(k => k.l > cs[i].l)) add(cs[i].l, 'elp', 'External Liquidity Pool');
+  }
+  t.htfc.forEach(c => { add(c.h, 'elp', 'External Liquidity Pool'); add(c.l, 'elp', 'External Liquidity Pool'); });
+  fv.forEach(f => add((f.lo + f.hi) / 2, 'fvg', f.dir > 0 ? 'FVG bullish' : 'FVG bearish'));
+  g.obs.forEach(o => add((o.lo + o.hi) / 2, 'ob', o.dir > 0 ? 'Order Block bullish' : 'Order Block bearish'));
+  if (t.tspot) add(t.tspot, 'tspot', 'T-spot TTFM'); if (g.erl && g.irl) add((g.erl + g.irl) / 2, 'eq', 'Equilibrium range');
+  const cx2 = S.ctx; if (cx2.ready) levelsAt(cx2.ex, getH4(), cx2.ex.length - 1, Date.now()).forEach(l => add(l.p, 'elp', l.label));
+  const d = Math.abs(score) >= 10 ? sgn(score) : sgn(fc.Q(0.5, H) - P0); if (!d) return null;
+  const lo98 = fc.Q(0.02, H), hi98 = fc.Q(0.98, H), hur = q.hurst, vm = q.regime === 'Ekstrem' ? 1.6 : q.regime === 'Tinggi' ? 1.3 : 1, tol = Math.max(0.6 * atr, 0.0004 * P0) * vm, minD = 0.35 * atr * Math.sqrt(H), dist = o => Math.abs(o.p - P0);
+  const cand = objs.filter(o => (d > 0 ? o.p > P0 + 0.5 * atr : o.p < P0 - 0.5 * atr) && o.p >= lo98 && o.p <= hi98 && !(hur < 0.45 && o.kind === 'elp' && dist(o) > 3 * atr * Math.sqrt(H)));
+  const wts = paths && S.anSet ? S.anSet.w : null;
+  const touch = L => {
+    if (paths) {
+      let p = 0; const hits = [];
+      paths.forEach((x, i) => { const w = wts ? wts[i] : 1 / paths.length; for (let k = 1; k <= H; k++) { const v = x[k] * P0; if (d > 0 ? v >= L : v <= L) { hits.push([k, w]); p += w; break; } } });
+      hits.sort((a, b) => a[0] - b[0]); let acc = 0, kk = H; for (const [k, w] of hits) { acc += w; if (acc >= p / 2) { kk = k; break; } }
+      return { p, k: kk };
+    }
+    if (!fc.mu) return { p: 0, k: H };
+    const z = (Math.log(L / P0) - fc.mu[H - 1]) / Math.sqrt(fc.vp[H - 1]), p = clamp(d > 0 ? 2 * (1 - cdf(z)) : 2 * cdf(z), 0, 1); let kk = H;
+    for (let k = 1; k <= H; k++) if (d > 0 ? fc.Q(0.5, k) >= L : fc.Q(0.5, k) <= L) { kk = k; break; }
+    return { p, k: kk };
+  };
+  const scored = cand.map(o => {
+    const cl = objs.filter(x => Math.abs(x.p - o.p) <= tol), labels = [...new Set(cl.map(x => x.label))].sort((a, b) => LABEL_ORDER.indexOf(a) - LABEL_ORDER.indexOf(b)), tc = touch(o.p);
+    return { cl, labels, tc, d: dist(o), sc: labels.length + 2.5 * tc.p + 0.4 * Math.min(2, dist(o) / minD) + (hur > 0.55 && o.kind === 'elp' ? 0.6 : 0) + (hur < 0.45 && ['ma', 'fvg', 'eq'].includes(o.kind) ? 0.6 : 0) };
+  });
+  const pick = (pm, dm) => scored.filter(s => s.tc.p >= pm && s.d >= dm).sort((a, b) => b.sc - a.sc)[0];
+  const main = pick(0.4, minD) || pick(0.3, minD * 0.5) || pick(0.25, 0); if (!main) return null;
+  const toT = s => ({ price: mean(s.cl.map(x => x.p)), labels: s.labels, p: s.tc.p, k: s.tc.k }), lad = [];
+  for (const s of [...scored].filter(s => s.tc.p >= 0.35).sort((a, b) => a.d - b.d)) { const x = toT(s); if (!lad.some(y => Math.abs(y.price - x.price) <= tol)) lad.push(x); if (lad.length === 3) break; }
+  return { ...toT(main), d, hur, n: S.anSet ? S.anSet.n : 0, ladder: lad, atr, objs };
+}
+function publishInsights(A) {
+  const { tg, q, wEff, fc } = A, h = q.hurst, st = fc.st;
+  bind('insight.target', tg ? `Dalam ${tg.k} candle ke depan pada timeframe ${TFN[cfg.tf]}, harga diproyeksikan mengejar titik harga ${fmt(tg.price)} (menuju konfluensi objek ${tg.labels.slice(0, 4).join(' / ')}).` : `Belum ada titik harga dengan konfluensi dan peluang sentuh yang cukup dalam ${A.H} candle. Tunggu struktur baru terbentuk.`);
+  bind('insight.meta', tg ? `Peluang tersentuh ${(tg.p * 100).toFixed(0)}% dalam ${A.H} candle (${tg.n} pola analog), arah ${tg.d > 0 ? 'naik' : 'turun'}. Hurst ${h.toFixed(2)}: ${h > 0.55 ? 'cenderung tren, likuiditas eksternal diutamakan' : h < 0.45 ? 'cenderung berbalik, magnet seperti MA dan FVG diutamakan' : 'mendekati acak, konfluensi tertinggi dipilih'}.` : '');
+  bind('insight.ladder', tg && tg.ladder.length ? `Tangga target: ${tg.ladder.map((x, i) => `TP${i + 1} ${fmt(x.price)} (peluang ${(x.p * 100).toFixed(0)}%)`).join(', ')}.` : '');
+  bind('insight.path', st ? st.why : 'Belum ada target dengan konfluensi cukup, jadi median mengikuti drift statistik tanpa proyeksi paksa.');
+  bind('bias.weights', `Matriks terpadu memakai ${A.mx.n} model aktif. Bobot mesin utama: Quant ${(wEff[0] * 100).toFixed(0)}%, TTFM ${(wEff[1] * 100).toFixed(0)}%, GXT ${(wEff[2] * 100).toFixed(0)}% (rezim ${h > 0.55 ? 'tren' : h < 0.45 ? 'berbalik' : 'acak'}, Hurst ${h.toFixed(2)}).`);
+  renderMatrix(A); renderSignal(); renderSummary();
+}
+/* Orkestrasi analisis */
+const labelOf = s => (s >= 50 ? 'Naik kuat' : s >= 15 ? 'Naik' : s > -15 ? 'Netral' : s > -50 ? 'Turun' : 'Turun kuat');
+function analyze() { try { analyze0(); } catch (e) { console.error(e); log(`Analisis gagal: ${e.message}`, 'error'); } }
+function analyze0() {
+  S.timer = 0;
+  if (S.candles.length < 260) { bind('narrative', `Menunggu riwayat minimal 260 candle (sekarang ${S.candles.length}).`); return; }
+  const all = S.candles, closed = S.closed ? all : all.slice(0, -1), cs = closed.slice(-Math.max(260, cfg.context)), M = fit(cs), H = cfg.horizon;
+  const q = quant(M, cs), t = ttfm(all), g = gxt(all, S.pair), fv = fvgs(all), px = all[all.length - 1].c;
+  const reg = q.hurst > 0.55 ? [1.2, 1.1, 0.8] : q.hurst < 0.45 ? [0.8, 0.9, 1.3] : [1, 1, 1], W = [cfg.wq * reg[0], cfg.wt * reg[1], cfg.wg * reg[2]], ws = W[0] + W[1] + W[2] || 1;
+  const wEff = W.map(w => w / ws);
+  const ck = `${closed[closed.length - 1].t}|${H}|${cfg.context}|${cfg.symbol}`;
+  if (S.anKey !== ck) { S.anSet = analogSet(M, cs, H); const big = closed.slice(-3000); S.Mbig = fit(big); S.cbt = compBacktest(S.Mbig, big, H); S.anKey = ck; }
+  const base = baseMV(M, H), ap = S.anSet ? analogPaths(S.anSet, base.vp, H) : null;
+  const ad = ap ? ap.dm.slice(1).map(v => 0.5 * v) : null, isExt = cfg.source === 'external' && S.ext && S.ext.H === H;
+  const mx = buildMatrix(M, cs, q, t, g, fv, ap, base, H, px), score = clamp(100 * mx.comp, -100, 100), tilt = 0.35 * (score / 100), pr = calProb(mx.sub, S.cbt);
+  const fc0 = isExt ? S.ext.fc : quantFc(M, H, base, tilt, ad);
+  const paths0 = ap && fc0.name === 'Quant ensemble' ? ap.paths.map(x => x.map((v, k) => Math.exp((k ? fc0.mu[k - 1] : 0) + v - ap.dm[k]))) : null;
+  const tg = targets(cs, q, g, t, fv, fc0, paths0, H, score), st = tg && fc0.name === 'Quant ensemble' ? structShape(tg, mx, fc0, H) : null;
+  const fc = st ? quantFc(M, H, base, tilt, ad, st) : fc0;
+  if (S.closed && fc.name === 'Quant ensemble') fc.state = 'Pasar tutup, proyeksi dari data terakhir';
+  const paths = ap && fc.name === 'Quant ensemble' ? ap.paths.map(x => x.map((v, k) => Math.exp((k ? fc.mu[k - 1] : 0) + v - ap.dm[k]))) : null;
+  const key = `${closed[closed.length - 1].t}|${H}|${cfg.drift}|${cfg.dist}|${cfg.context}|${cfg.symbol}`;
+
+  const trg = [];
+  if (S.btKey !== key) {
+    S.bt = backtest(S.Mbig || M, H); S.btKey = key; S.reveal = performance.now(); S.rv = { x: 0, v: 0 }; S.stage = true;
+    const prev = S.live.pend, done = prev && all.find(c => c.t === prev.t && c.t < all[all.length - 1].t);
+    if (done) { S.live.n++; if (sgn(done.c - prev.p0) === prev.dir) S.live.hit++; }
+    S.live.pend = { t: all[all.length - 1].t, p0: fc.P0, dir: sgn(fc.Q(0.5, 1) - fc.P0) };
+    log(`bias gabungan ${score.toFixed(0)} menggeser median ${tilt.toFixed(2)} simpangan baku`);
+    log(`median ${fmt(fc.Q(0.5, H))}, p10 ${fmt(fc.Q(0.1, H))}, p90 ${fmt(fc.Q(0.9, H))}`);
+    log(paths ? `${S.anSet.n} pola analog termirip dipilih (jarak median ${S.anSet.tau.toFixed(2)}), horizon ${H}` : `skenario dari model eksternal atau riwayat pendek, horizon ${H}`);
+    log(`fit Kalman local linear trend dan GARCH(1,1) pada ${cs.length} candle`);
+    log(`sumber ${S.src || 'data'}: ${all.length} candle ${cfg.symbol} ${cfg.tf}`);
+  }
+  S.an = { fc, q, t, g, fv, score, label: labelOf(score), H, px, paths, upN: paths ? paths.filter(p => p[H] >= 1).length : 0, tg, trg, wEff, mx, pr, id: ++S.anId };
+  publish(S.an); S.dirty = true;
+}
+function publish(A) {
+  const { q, t, g, fc, H, score } = A, dir = score >= 15 ? 'up' : score <= -15 ? 'down' : 'flat';
+  Object.entries(q.text).forEach(([k, v]) => bind(`q.${k}`, v));
+  const near = A.fv.length ? A.fv.reduce((a, b) => (Math.abs((b.lo + b.hi) / 2 - A.px) < Math.abs((a.lo + a.hi) / 2 - A.px) ? b : a)) : null;
+  Object.entries({ htf: t.htf, sequence: t.seq, sweep: t.sweep, tspot: t.tspot ? fmt(t.tspot) : 'Belum ada', fvg: near ? `${near.dir > 0 ? 'Bullish' : 'Bearish'} ${fmt(near.lo)} sampai ${fmt(near.hi)}` : 'Tidak ada', bias: labelOf(t.score) }).forEach(([k, v]) => bind(`t.${k}`, v));
+  Object.entries({ pair: g.pair, smt: g.smt, erl: g.erl ? fmt(g.erl) : '-', irl: g.irl ? fmt(g.irl) : '-', zone: g.zone, displacement: g.disp, sweep: g.sweep, ob: g.ob, bias: labelOf(g.score) }).forEach(([k, v]) => bind(`g.${k}`, v));
+  setDir('t.bias', t.score); setDir('g.bias', g.score);
+  [['quant', q.score], ['ttfm', t.score], ['gxt', g.score]].forEach(([k, s]) => { const li = $(`[data-engine="${k}"]`); li.dataset.dir = dirOf(s); $('meter', li).value = s; bind(`vote.${k}`, s.toFixed(0)); setDir(`vote.${k}`, s); });
+  const gauge = $('#gauge'); gauge.style.setProperty('--score', score.toFixed(1)); gauge.dataset.dir = dir;
+  bind('bias.label', A.label); bind('bias.score', `${score > 0 ? '+' : ''}${score.toFixed(0)}`);
+  bind('model.name', fc.name); if (revealP() >= 1) bind('model.state', fc.state);
+  liveBinds();
+  const b = S.bt || {}, cb = S.cbt, ok = cb && cb.n;
+  bind('bt.n', ok ? `${cb.n} (kausal, tiap 3 candle)` : '-'); bind('bt.hit', ok ? `${(cb.wr * 100).toFixed(1)}% (batas bawah ${(cb.lb * 100).toFixed(1)}%)` : '-');
+  bind('bt.cov', Number.isFinite(b.cov) ? `${(b.cov * 100).toFixed(1)}% (target 80%)` : '-');
+  bind('bt.skill', ok ? `${cb.wr >= 0.5 ? '+' : ''}${((cb.wr - 0.5) * 100).toFixed(1)} poin (batas bawah ${((cb.lb - 0.5) * 100).toFixed(1)})` : '-'); setDir('bt.skill', ok ? cb.lb - 0.5 : 0);
+  const m = fc.Q(0.5, H) / fc.P0 - 1, lo = fc.Q(0.1, H) / fc.P0 - 1, hi = fc.Q(0.9, H) / fc.P0 - 1;
+  publishInsights(A);
+  bind('narrative', `${cfg.symbol} ${cfg.tf}: bias gabungan ${A.label.toLowerCase()} (${score > 0 ? '+' : ''}${score.toFixed(0)}). Quant membaca tren ${q.trendZ > 0.3 ? 'naik' : q.trendZ < -0.3 ? 'turun' : 'datar'} dengan volatilitas ${q.regime.toLowerCase()}. TTFM: ${t.seq.toLowerCase()}. GXT: harga di zona ${g.zone.toLowerCase()}, ${g.smt.toLowerCase()}. Skenario dasar ${H} candle: median ${pct(m)}, rentang 80% ${pct(lo)} sampai ${pct(hi)}, peluang naik ${(fc.up(H) * 100).toFixed(0)}%. Ini estimasi statistik, bukan kepastian.`);
+}
+const queue = now => { if (now) { clearTimeout(S.timer); analyze(); refreshExternal(); } else if (!S.timer) S.timer = setTimeout(analyze, 250); };
+async function refreshExternal() {
+  if (cfg.source !== 'external' || !cfg.endpoint || S.candles.length < 260) { S.ext = null; return; }
+  const key = `${cfg.symbol}${cfg.tf}${cfg.horizon}${S.candles.at(-1).t}`;
+  if (S.ext?.key === key) return;
+  try {
+    const res = await fetch(cfg.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: cfg.symbol, interval: cfg.tf, horizon: cfg.horizon, candles: S.candles.slice(-cfg.context).map(c => [c.t, c.o, c.h, c.l, c.c, c.v]) }) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const ls = (await res.json()).lines.map(l => ({ p: +l.p, v: l.prices.map(Number) })).sort((a, b) => a.p - b.p);
+    S.ext = { key, H: cfg.horizon, fc: extFc(ls, S.candles.at(-1).c, cfg.horizon) }; log('Prediksi model eksternal diterima'); queue();
+  } catch (e) { S.ext = null; log(`Model eksternal gagal (${e.message}), memakai mesin quant`, 'warn'); }
+}
+
+/* Feed realtime. Sumber: relay WebSocket (jembatan MT5 atau broker sendiri) atau Twelve Data. Tanpa data acak. */
+const FEED = { idle: 'Belum terhubung', connecting: 'Menghubungkan', live: 'Langsung', closed: 'Pasar tutup', stale: 'Tertunda', offline: 'Terputus' };
+const setFeed = s => { $('#feed-chip').dataset.state = s; bind('feed.state', FEED[s]); };
+const showEmpty = v => { $('#chart-empty').hidden = !v; };
+const showError = (v, msg) => { $('#chart-error').hidden = !v; if (msg) bind('error.message', msg); };
+const pairSym = () => {
+  const s = cfg.symbol;
+  if (cfg.provider === 'deriv') { if (cfg.smt !== 'auto') return /^[A-Z]{6}$/.test(cfg.smt) ? `frx${cfg.smt}` : cfg.smt; if (DERIV_PAIR[s]) return DERIV_PAIR[s]; const p = SMT_AUTO[norm(s).replace(/^FRX/, '')]; return p ? `frx${p}` : null; }
+  if (cfg.smt !== 'auto') return cfg.smt; const p = SMT_AUTO[norm(s)]; return p ? (cfg.provider === 'twelve' ? tdName(p) : p) : null;
+};
+const ready = () => (cfg.provider === 'relay' ? /^wss?:\/\/.+/i.test(cfg.relayUrl) : cfg.provider === 'twelve' ? !!cfg.apiKey : true);
+const liveP = () => { const l = S.candles[S.candles.length - 1]; return l ? l.c : 0; };
+const rowK = r => ({ t: +r[0], o: +r[1], h: +r[2], l: +r[3], c: +r[4], v: +r[5] || 0 });
+function upsert(arr, k) {
+  const l = arr[arr.length - 1];
+  if (!l || k.t > l.t) arr.push(k); else if (k.t === l.t) arr[arr.length - 1] = k; else { const i = arr.findIndex(c => c.t === k.t); if (i >= 0) arr[i] = k; }
+  if (arr.length > 1500) arr.shift();
+}
+/* Sinkronisasi tick: harga masuk ke candle berjalan menurut grid waktu milik sumber data, candle baru dibuat saat grid terlewati */
+function applyTick(arr, price, tMs) {
+  const l = arr[arr.length - 1]; if (!l || tMs < l.t) return false;
+  const ms = TF[cfg.tf], t0 = l.t + Math.floor((tMs - l.t) / ms) * ms;
+  if (t0 > l.t) arr.push({ t: t0, o: price, h: price, l: price, c: price, v: 1 });
+  else { l.c = price; if (price > l.h) l.h = price; if (price < l.l) l.l = price; l.v++; }
+  if (arr.length > 1500) arr.shift();
+  return true;
+}
+function onTick(sym, price, tMs) {
+  if (!Number.isFinite(price)) return;
+  const f = S.feed, now = Date.now(), t = Number.isFinite(tMs) ? tMs : now + f.skew, dec = (String(price).split('.')[1] || '').length;
+  f.last = now; f.ticks.push(now); f.lat = Math.max(0, now + f.skew - t);
+  if (cfg.provider === 'twelve' && dec > S.digits) S.digits = Math.min(dec, 6);
+  if (norm(sym) === norm(cfg.symbol)) { if (applyTick(S.candles, price, t)) { exFeed(price, t); S.qDirty = true; S.dirty = true; queue(); } }
+  else if (pairSym() && norm(sym) === norm(pairSym())) applyTick(S.pair, price, t);
+}
+function onHistory(sym, rows) {
+  const arr = rows.map(rowK).filter(k => Number.isFinite(k.c) && Number.isFinite(k.t)).sort((a, b) => a.t - b.t);
+  if (!arr.length) return;
+  if (norm(sym) !== norm(cfg.symbol)) { S.pair = arr; return; }
+  const prev = S.candles[S.candles.length - 1], miss = prev ? arr.filter(k => k.t > prev.t).length : 0;
+  if (miss) { S.feed.gaps += miss; bind('feed.gaps', S.feed.gaps); log(`${miss} candle yang terlewat ditambal dari sumber`, 'warn'); }
+  S.candles = arr; S.feed.tries = 0; setFeed(S.closed ? 'closed' : 'live'); showEmpty(false); showError(false); updateQuote(); S.dirty = true; queue(true);
+  log(`Riwayat ${arr.length} candle ${cfg.symbol} ${cfg.tf} dimuat`);
+  if (!S.ctx.started) { S.ctx.started = true; ctxPull(true); }
+}
+function relayMsg(m) {
+  if (m.type === 'tick') onTick(m.symbol, +(m.bid ?? m.price), +m.t);
+  else if (m.type === 'history') { if (m.id) { ctxIn(m.id === 'h4' ? 'h4' : 'ex', m.candles || []); ctxCheck(); } else onHistory(m.symbol, m.candles || []); }
+  else if (m.type === 'bar') { if (norm(m.symbol) === norm(cfg.symbol) && m.candle) { upsert(S.candles, rowK(m.candle)); S.dirty = true; S.qDirty = true; } }
+  else if (m.type === 'pong') { const rtt = Date.now() - m.t; S.feed.rtt = rtt; S.feed.skew = m.s - (m.t + rtt / 2); }
+  else if (m.type === 'info') { S.src = [m.broker, m.server].filter(Boolean).join(' / ') || 'Relay'; if (m.digits != null) S.digits = +m.digits; if (m.dayOpenUtcMs != null) S.anchor = +m.dayOpenUtcMs; }
+  else if (m.type === 'error') log(`Relay: ${m.message}`, 'warn');
+}
+function connectRelay(gen) {
+  const ws = new WebSocket(cfg.relayUrl); S.feed.ws = ws;
+  ws.onopen = () => {
+    S.feed.last = Date.now(); log('Terhubung ke relay');
+    ws.send(JSON.stringify({ type: 'subscribe', symbols: [cfg.symbol, pairSym()].filter(Boolean), tf: cfg.tf, count: 1000 }));
+    const ping = () => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'ping', t: Date.now() })); };
+    ping(); clearInterval(S.feed.iv); S.feed.iv = setInterval(ping, 4000);
+  };
+  ws.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch { return; } S.feed.last = Date.now(); relayMsg(m); };
+  ws.onerror = () => ws.close();
+  ws.onclose = () => { clearInterval(S.feed.iv); lost(gen, 'relay'); };
+}
+const TDIV = { '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min', '1h': '1h', '4h': '4h', '1d': '1day' };
+async function tdHistory(sym, n, tf = cfg.tf) {
+  const r = await fetch(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=${TDIV[tf]}&outputsize=${n}&order=ASC&timezone=UTC&apikey=${encodeURIComponent(cfg.apiKey)}`), j = await r.json();
+  if (j.status === 'error' || !j.values) throw new Error(j.message || `HTTP ${r.status}`);
+  return j.values.map(v => [Date.parse(v.datetime.length > 10 ? `${v.datetime.replace(' ', 'T')}Z` : `${v.datetime}T00:00:00Z`), v.open, v.high, v.low, v.close, v.volume || 0]);
+}
+function connectTD(gen) {
+  const ws = new WebSocket(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${encodeURIComponent(cfg.apiKey)}`); S.feed.ws = ws;
+  ws.onopen = () => {
+    S.feed.last = Date.now(); log('Terhubung ke Twelve Data');
+    ws.send(JSON.stringify({ action: 'subscribe', params: { symbols: [cfg.symbol, pairSym()].filter(Boolean).join(',') } }));
+    clearInterval(S.feed.iv); S.feed.iv = setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ action: 'heartbeat' })); }, 10000);
+  };
+  ws.onmessage = e => {
+    let m; try { m = JSON.parse(e.data); } catch { return; } S.feed.last = Date.now();
+    if (m.event === 'price') onTick(m.symbol, +(m.bid ?? m.price), +m.timestamp * 1000);
+    else if (m.event === 'subscribe-status' && m.fails && m.fails.length) log(`Twelve Data menolak simbol: ${m.fails.map(x => x.symbol).join(', ')}`, 'error');
+  };
+  ws.onerror = () => ws.close();
+  ws.onclose = () => { clearInterval(S.feed.iv); lost(gen, 'Twelve Data'); };
+}
+const DERIV_EP = ['wss://api.derivws.com/trading/v1/options/ws/public', 'wss://ws.derivws.com/websockets/v3?app_id=1089', 'wss://ws.binaryws.com/websockets/v3?app_id=1089'];
+const DERIV_GR = { '1m': 60, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400 };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const dispName = s => { const d = S.dsyms && S.dsyms.find(x => x.s === s); if (d) return d.n; const p = (PRESETS[cfg.provider] || []).find(i => i[1] === s); return p ? p[2] : s; };
+const dayTime = v => new Intl.DateTimeFormat('id-ID', { weekday: 'long', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(v)).replace(':', '.');
+function showNotice() {
+  const el = $('#chart-notice'), u = S.closed && S.closed.until, open = S.dsyms ? S.dsyms.filter(x => x.c === 'cry' && x.open).slice(0, 3) : [], alt = open.length ? open : [{ s: 'cryBTCUSD', n: 'Bitcoin' }, { s: 'cryETHUSD', n: 'Ethereum' }];
+  el.innerHTML = `<span>Pasar ${esc(dispName(cfg.symbol))} sedang tutup${u ? `, buka ${dayTime(u)}` : ''}. Grafik memakai data terakhir. Instrumen 24/7:</span>${alt.map(x => `<button type="button" class="btn" data-s="${esc(x.s)}">${esc(x.n)}</button>`).join('')}`; el.hidden = false;
+}
+const hideNotice = () => { $('#chart-notice').hidden = true; };
+function connectDeriv(gen) {
+  const ws = new WebSocket(DERIV_EP[S.feed.ep % DERIV_EP.length]); S.feed.ws = ws;
+  const req = (sym, id, sub = 1) => { if (ws.readyState === 1) ws.send(JSON.stringify({ ticks_history: sym, adjust_start_time: 1, count: 1000, end: 'latest', start: 1, style: 'candles', granularity: DERIV_GR[cfg.tf], ...(sub ? { subscribe: 1 } : {}), req_id: id })); };
+  S.feed.req = req; S.feed.send = o => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
+  ws.onopen = () => {
+    S.feed.last = Date.now(); S.src = 'Deriv (data pasar publik)'; log('Terhubung ke Deriv'); req(cfg.symbol, 1); const p = pairSym(); if (p) req(p, 2);
+    ws.send(JSON.stringify({ active_symbols: 'brief', product_type: 'basic', req_id: 3 }));
+    const tm = () => {
+      if (ws.readyState !== 1) return; ws.send(JSON.stringify({ time: 1, passthrough: { t: Date.now() } }));
+      if (S.closed && ++S.feed.rt % (S.closed.until && Date.now() > S.closed.until ? 3 : 12) === 0) req(cfg.symbol, 1);
+    };
+    tm(); clearInterval(S.feed.iv); S.feed.iv = setInterval(tm, 5000);
+  };
+  ws.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch { return; } S.feed.last = Date.now(); derivMsg(m); };
+  ws.onerror = () => ws.close();
+  ws.onclose = () => { clearInterval(S.feed.iv); lost(gen, 'Deriv'); };
+}
+function derivMsg(m) {
+  const f = S.feed, now = Date.now();
+  if (m.error) {
+    const id = m.req_id, msg = m.error.message || ''; if (id >= 20) { S.ctx.err = `Data eksekusi tidak tersedia dari sumber ini: ${msg}`; return; }
+    if ((id === 1 || id === 2) && (m.error.code === 'MarketIsClosed' || /closed/i.test(msg))) {
+      if (id === 1 && !S.closed) {
+        const t = /open at (\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d)/.exec(msg); S.closed = { until: t ? Date.parse(`${t[1]}T${t[2]}Z`) : null };
+        log(`Pasar ${cfg.symbol} sedang tutup${S.closed.until ? `, buka ${dayTime(S.closed.until)}` : ''}. Memakai data terakhir.`, 'warn'); f.req(cfg.symbol, 11, 0); showNotice();
+      } else if (id === 2 && !S.pair.length && pairSym()) f.req(pairSym(), 12, 0);
+      return;
+    }
+    log(`Deriv: ${msg}`, 'warn');
+    if ((id === 1 || id === 11) && !S.candles.length) { showEmpty(false); showError(true, `Deriv menolak simbol ${cfg.symbol}: ${msg}`); }
+    return;
+  }
+  if (m.msg_type === 'active_symbols') {
+    const catOf = x => (x.market === 'forex' ? 'fx' : x.market === 'cryptocurrency' ? 'cry' : x.market === 'indices' ? 'idx' : x.market === 'commodities' ? 'met' : null);
+    S.dsyms = (m.active_symbols || []).map(x => ({ s: x.symbol, n: x.display_name, c: catOf(x), open: !!x.exchange_is_open && !x.is_trading_suspended })).filter(x => x.c);
+    const me = S.dsyms.find(x => x.s === cfg.symbol); if (me) { S.dname = me.n; bind('symbol', me.n); }
+    renderPicker(); if (S.closed) showNotice(); return;
+  }
+  if (m.msg_type === 'candles') {
+    if (m.req_id >= 20) { derivCtx(m); return; } const id = m.req_id; if (m.pip_size != null && (id === 1 || id === 11)) S.digits = +m.pip_size;
+    if (id === 1 && S.closed) { S.closed = null; hideNotice(); log('Pasar sudah buka, tersambung ke stream langsung'); }
+    onHistory(m.echo_req.ticks_history, (m.candles || []).map(c => [c.epoch * 1000, c.open, c.high, c.low, c.close, 0]));
+  } else if (m.msg_type === 'ohlc') {
+    const o = m.ohlc, main = norm(o.symbol) === norm(cfg.symbol); if (!main && !(pairSym() && norm(o.symbol) === norm(pairSym()))) return;
+    const arr = main ? S.candles : S.pair, l = arr[arr.length - 1], t = o.open_time * 1000;
+    upsert(arr, { t, o: +o.open, h: +o.high, l: +o.low, c: +o.close, v: (l && l.t === t ? l.v : 0) + 1 });
+    if (main) { if (o.pip_size != null) S.digits = +o.pip_size; f.ticks.push(now); f.lat = Math.max(f.rtt / 2, now + f.skew - o.epoch * 1000); exFeed(+o.close, o.epoch * 1000); S.qDirty = true; S.dirty = true; queue(); }
+  } else if (m.msg_type === 'time') { const rtt = now - m.echo_req.passthrough.t; f.rtt = rtt; f.skew = m.time * 1000 - (m.echo_req.passthrough.t + rtt / 2); }
+}
+function lost(gen, why) {
+  if (gen !== S.feed.gen) return;
+  const d = Math.min(15000, 500 * 2 ** S.feed.tries++); setFeed('offline'); S.feed.reconnects++; S.feed.ep++; bind('feed.reconnects', S.feed.reconnects);
+  if (!S.candles.length && S.feed.reconnects >= 2) { showEmpty(false); showError(true, 'Belum bisa terhubung ke sumber data. Periksa internet atau pilih sumber lain lewat ikon sambung.'); }
+  log(`Koneksi ${why} putus, mencoba lagi dalam ${(d / 1000).toFixed(1)} dtk`, 'warn');
+  setTimeout(() => { if (gen === S.feed.gen) start(gen); }, d);
+}
+async function start(gen) {
+  try {
+    if (cfg.provider === 'relay') return connectRelay(gen);
+    if (cfg.provider === 'deriv') return connectDeriv(gen);
+    const p = pairSym(), [main, pair] = await Promise.all([tdHistory(cfg.symbol, 1000), p ? tdHistory(p, 300).catch(() => []) : []]);
+    if (gen !== S.feed.gen) return;
+    S.src = 'Twelve Data'; onHistory(cfg.symbol, main); if (pair.length) onHistory(p, pair); connectTD(gen);
+  } catch (e) { if (gen !== S.feed.gen) return; setFeed('offline'); showEmpty(false); showError(true, `Gagal memuat data (${e.message}).`); log(`Gagal memuat riwayat: ${e.message}`, 'error'); lost(gen, 'sumber'); }
+}
+function closeWs() { const w = S.feed.ws; clearInterval(S.feed.iv); if (w) { w.onclose = null; w.onmessage = null; w.onerror = null; try { w.close(); } catch { /* abaikan */ } } S.feed.ws = null; }
+async function load() {
+  const gen = ++S.feed.gen; closeWs(); S.candles = []; S.pair = []; S.an = null; S.ext = null; S.btKey = ''; S.anKey = ''; S.anSet = null; S.view.off = 0; S.live = { hit: 0, n: 0, pend: null }; S.src = ''; S.digits = 0; S.feed.tries = 0; S.closed = null; S.feed.rt = 0; S.ctx = freshCtx();
+  bind('symbol', dispName(cfg.symbol)); bind('model.state', 'Menunggu data');
+  const idle = msg => { setFeed('idle'); showEmpty(false); showError(true, msg); };
+  if (!ready()) return idle('Belum ada sumber data. Tekan ikon sambung di bilah atas untuk menghubungkan broker.');
+  if (cfg.provider === 'relay' && location.protocol === 'https:' && /^ws:\/\//i.test(cfg.relayUrl) && !/^ws:\/\/(localhost|127\.0\.0\.1)/i.test(cfg.relayUrl)) return idle('Halaman HTTPS tidak boleh memakai ws://. Pakai alamat wss:// (misalnya lewat tunnel) untuk relay.');
+  showEmpty(true); showError(false); hideNotice(); setFeed('connecting'); start(gen);
+}
+function updateQuote() {
+  const c = S.candles[S.candles.length - 1]; if (!c) return;
+  bind('price', fmt(c.c)); setDir('price', c.c - (S.px || c.c)); S.px = c.c;
+  ['o', 'h', 'l', 'c'].forEach(k => bind(`bar.${k}`, fmt(c[k]))); bind('bar.v', Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 2 }).format(c.v));
+  const ref = S.candles[idxOf(c.t - 864e5)]; if (ref && ref !== c) { const ch = c.c / ref.o - 1; bind('change24h', pct(ch)); setDir('change24h', ch); }
+}
+function liveBinds() {
+  const A = S.an; if (!A) return; const { fc, H } = A, hs = [...new Set([1, Math.ceil(H / 4), Math.ceil(H / 2), H])].sort((a, b) => a - b);
+  $('#fc-rows').innerHTML = hs.map(k => { const u = fc.up(k); return `<tr><td>+${k} candle</td><td>${fmt(fc.Q(0.1, k))}</td><td>${fmt(fc.Q(0.5, k))}</td><td>${fmt(fc.Q(0.9, k))}</td><td data-dir="${u >= 0.5 ? 'up' : 'down'}">${(u * 100).toFixed(0)}%</td></tr>`; }).join('');
+  bind('sc.median', fmt(fc.Q(0.5, H))); setDir('sc.median', fc.Q(0.5, H) - fc.P0);
+  bind('sc.up', A.paths ? `${A.upN}/${A.paths.length} jalur naik` : `${(fc.up(H) * 100).toFixed(0)}% peluang naik`);
+  bind('sc.spread', fmt(fc.Q(0.9, H) - fc.Q(0.1, H)));
+  bind('sc.hit', S.live.n ? `${S.live.hit}/${S.live.n} (${((S.live.hit / S.live.n) * 100).toFixed(0)}%)` : 'Menunggu candle ditutup');
+}
+function heartbeat() {
+  const f = S.feed, now = Date.now(), c = S.candles[S.candles.length - 1]; bind('clock.utc', new Date(now).toISOString().slice(11, 19));
+  f.ticks = f.ticks.filter(t => now - t < 3000); const tps = f.ticks.length / 3;
+  bind('feed.latency', f.ticks.length ? `${f.lat.toFixed(0)} ms` : '-'); bind('feed.tps', `${tps.toFixed(0)}/dtk`); bind('feed.skew', `${f.skew.toFixed(0)} ms`);
+  bind('feed.rtt', f.rtt ? `${f.rtt} ms` : '-'); bind('feed.source', S.src || '-'); bind('feed.fps', `${(1000 / S.dt).toFixed(0)}`);
+  if (c) bind('bar.countdown', hms((S.closed && S.closed.until ? S.closed.until : c.t + TF[cfg.tf]) - (now + f.skew)));
+  if (f.ws && f.ws.readyState === 1) { if (f.last && now - f.last > 15000) f.ws.close(); else setFeed(S.closed ? 'closed' : f.last && now - f.last > 8000 ? 'stale' : 'live'); }
+}
+
+/* Renderer canvas */
+const cv = { grid: $('#cv-grid'), cs: $('#cv-candles'), fc: $('#cv-forecast'), hud: $('#cv-hud') };
+const cx = Object.fromEntries(Object.entries(cv).map(([k, c]) => [k, c.getContext('2d')]));
+const box = { w: 0, h: 0 }, PAD = { l: 8, r: 72, t: 48, b: 26 };
+const css = (n, d) => getComputedStyle(document.documentElement).getPropertyValue(n).trim() || d;
+let C = {};
+function resize() {
+  const r = $('#chart').getBoundingClientRect(), d = Math.min(devicePixelRatio || 1, 2); box.w = r.width; box.h = r.height; if (!S.zoomed) S.view.bars = r.width < 520 ? 60 : 90;
+  for (const k in cv) { cv[k].width = r.width * d; cv[k].height = r.height * d; cx[k].setTransform(d, 0, 0, d, 0, 0); }
+  S.off = S.off || document.createElement('canvas'); S.off.width = r.width * d; S.off.height = r.height * d; S.offCtx = S.off.getContext('2d'); S.offCtx.setTransform(d, 0, 0, d, 0, 0); S.fcKey = ''; S.tmp = S.tmp || document.createElement('canvas'); S.tmp.width = r.width * d; S.tmp.height = r.height * d; S.tmpCtx = S.tmp.getContext('2d'); S.tmpCtx.setTransform(d, 0, 0, d, 0, 0);
+  S.dirty = true;
+}
+function geom() {
+  const n = S.candles.length, v = clamp(Math.round(S.view.bars), 20, Math.min(400, n)), off = clamp(Math.round(S.view.off), 0, Math.max(0, n - v));
+  S.view.off = off;
+  const last = n - 1 - off, start = last - v + 1, showF = cfg.layers.forecast && !!S.an && off === 0, fut = showF ? S.an.H : 3;
+  const pw = box.w - PAD.l - PAD.r, ph = box.h - PAD.t - PAD.b, bw = pw / (v + fut);
+  let hi = -Infinity, lo = Infinity;
+  for (let i = start; i <= last; i++) { const c = S.candles[i]; if (c.h > hi) hi = c.h; if (c.l < lo) lo = c.l; }
+  if (showF) { hi = Math.max(hi, S.an.fc.Q(0.975, S.an.H)); lo = Math.min(lo, S.an.fc.Q(0.025, S.an.H)); }
+  const pad = (hi - lo) * 0.06 || hi * 0.001; hi += pad; lo -= pad;
+  return { n, v, off, last, start, showF, pw, ph, bw, hi, lo, x: i => PAD.l + (i - start + 0.5) * bw, y: p => PAD.t + ((hi - p) / (hi - lo)) * ph };
+}
+const idxOf = t => { let a = 0, b = S.candles.length; while (a < b) { const m = (a + b) >> 1; if (S.candles[m].t < t) a = m + 1; else b = m; } return a; };
+const clip = (c, g) => { c.save(); c.beginPath(); c.rect(PAD.l, PAD.t - 8, g.pw + 2, box.h - PAD.b - PAD.t + 8); c.clip(); };
+function orb(c, x, y, r, rgb) {
+  if (![x, y, r].every(Number.isFinite)) return;
+  const g = c.createRadialGradient(x - r * 0.3, y - r * 0.3, 0, x, y, r * 1.8);
+  g.addColorStop(0, '#fff'); g.addColorStop(0.35, `rgba(${rgb},.95)`); g.addColorStop(1, `rgba(${rgb},0)`);
+  c.fillStyle = g; c.beginPath(); c.arc(x, y, r * 1.8, 0, 7); c.fill();
+}
+function drawGrid(g) {
+  const c = cx.grid; c.clearRect(0, 0, box.w, box.h);
+  const raw = (g.hi - g.lo) / 6, mag = 10 ** Math.floor(Math.log10(raw)), step = [1, 2, 5, 10].map(m => m * mag).find(s => s >= raw);
+  c.font = '11px Geist, system-ui, sans-serif'; c.fillStyle = C.ink3; c.strokeStyle = 'rgba(13,20,32,.07)'; c.lineWidth = 1; c.textAlign = 'left'; c.textBaseline = 'middle';
+  for (let p = Math.ceil(g.lo / step) * step; p < g.hi; p += step) { const y = Math.round(g.y(p)) + 0.5; c.beginPath(); c.moveTo(PAD.l, y); c.lineTo(box.w - PAD.r, y); c.stroke(); c.fillText(fmt(p, step < 1 ? 4 : step < 10 ? 2 : 0), box.w - PAD.r + 8, y); }
+  c.textAlign = 'center'; c.textBaseline = 'top';
+  const every = Math.max(1, Math.ceil(90 / g.bw));
+  for (let i = g.start; i <= g.last; i++) if ((g.last - i) % every === 0) { const d = new Date(S.candles[i].t).toISOString(); c.fillText(TF[cfg.tf] >= 864e5 ? d.slice(5, 10) : d.slice(11, 16), g.x(i), box.h - PAD.b + 8); }
+}
+function drawCandles(g) {
+  const c = cx.cs, L = cfg.layers, A = S.an; c.clearRect(0, 0, box.w, box.h); clip(c, g);
+  c.font = '11px Geist, system-ui, sans-serif'; c.textAlign = 'left'; c.textBaseline = 'bottom';
+  if (L.sessions && TF[cfg.tf] <= 36e5) {
+    for (let i = g.start; i <= g.last; i++) {
+      const d = new Date(S.candles[i].t), nm = { 0: 'Asia', 7: 'London', 13: 'New York' }[d.getUTCHours()];
+      if (nm && d.getUTCMinutes() === 0) { c.strokeStyle = 'rgba(13,20,32,.12)'; c.setLineDash([2, 4]); c.beginPath(); c.moveTo(g.x(i), PAD.t); c.lineTo(g.x(i), box.h - PAD.b); c.stroke(); c.setLineDash([]); c.fillStyle = C.ink3; c.fillText(nm, g.x(i) + 4, box.h - PAD.b - 4); }
+    }
+  }
+  if (L.htf && A) A.t.htfc.forEach((h, j) => {
+    const x1 = g.x(idxOf(h.t)) - g.bw / 2, x2 = g.x(idxOf(h.end)) + g.bw / 2;
+    c.fillStyle = 'rgba(122,108,240,.05)'; c.strokeStyle = 'rgba(122,108,240,.4)'; c.beginPath(); c.roundRect(x1, g.y(h.h), x2 - x1, g.y(h.l) - g.y(h.h), 8); c.fill(); c.stroke();
+    c.fillStyle = C.iris; c.textBaseline = 'top'; c.fillText(`C${j + 1}`, x1 + 6, g.y(h.h) + 5);
+  });
+  if (L.fvg && A) A.fv.forEach(f => { c.fillStyle = f.dir > 0 ? 'rgba(15,159,122,.11)' : 'rgba(229,72,77,.11)'; const x1 = g.x(f.i) - g.bw / 2; c.fillRect(x1, g.y(f.hi), PAD.l + g.pw - x1, g.y(f.lo) - g.y(f.hi)); });
+  if (L.fvg && A) A.g.obs.forEach(o => { const x1 = g.x(o.i) - g.bw / 2; c.fillStyle = o.dir > 0 ? 'rgba(40,184,216,.13)' : 'rgba(247,169,53,.15)'; c.fillRect(x1, g.y(o.hi), PAD.l + g.pw - x1, g.y(o.lo) - g.y(o.hi)); c.fillStyle = o.dir > 0 ? C.cyan : C.amber; c.textAlign = 'left'; c.textBaseline = 'top'; c.fillText('OB', x1 + 3, g.y(o.hi) + 2); });
+  const w = Math.max(1, g.bw * 0.68);
+  for (let i = Math.max(0, g.start); i <= g.last; i++) {
+    const k = S.candles[i], x = g.x(i), yo = g.y(k.o), yc = g.y(k.c);
+    c.fillStyle = c.strokeStyle = k.c >= k.o ? C.up : C.down; c.lineWidth = 1;
+    c.beginPath(); c.moveTo(x, g.y(k.h)); c.lineTo(x, g.y(k.l)); c.stroke();
+    c.beginPath(); c.roundRect(x - w / 2, Math.min(yo, yc), w, Math.max(1, Math.abs(yo - yc)), Math.min(2, w / 3)); c.fill();
+  }
+  if (L.liquidity && A) {
+    c.textBaseline = 'bottom';
+    [[A.g.erl, 'ERL', C.iris], [A.g.irl, 'IRL', C.amber], [A.t.tspot, 'T-spot', C.cyan], [A.tg && A.tg.price, 'Target', '#f7b733']].forEach(([p, nm, col]) => {
+      if (!p || p > g.hi || p < g.lo) return; const y = Math.round(g.y(p)) + 0.5;
+      c.strokeStyle = col; c.fillStyle = col; c.setLineDash([5, 5]); c.lineWidth = 1; c.beginPath(); c.moveTo(PAD.l, y); c.lineTo(PAD.l + g.pw, y); c.stroke(); c.setLineDash([]); c.fillText(nm, PAD.l + 6, y - 3);
+    });
+  }
+  c.restore();
+}
+const ease = x => (x < 0.5 ? 4 * x ** 3 : 1 - ((-2 * x + 2) ** 3) / 2);
+function revealP() { return S.rv.x; }
+const relOf = f => f.rel || ((p, k) => f.Q(p, k) / f.P0);
+/* Catmull-Rom ke Bezier kubik: kurva kontinu tanpa ruas lurus */
+const bez = (c, pts) => { for (let i = 0; i < pts.length - 1; i++) { const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2; c.bezierCurveTo(p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6, p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6, p2[0], p2[1]); } };
+function prep(pts, per = 8) {
+  const d = [pts[0]];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2, c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6], c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
+    for (let s = 1; s <= per; s++) { const u = s / per, v = 1 - u; d.push([v * v * v * p1[0] + 3 * v * v * u * c1[0] + 3 * v * u * u * c2[0] + u * u * u * p2[0], v * v * v * p1[1] + 3 * v * v * u * c1[1] + 3 * v * u * u * c2[1] + u * u * u * p2[1]]); }
+  }
+  const cum = [0]; for (let i = 1; i < d.length; i++) cum.push(cum[i - 1] + Math.hypot(d[i][0] - d[i - 1][0], d[i][1] - d[i - 1][1]));
+  return { d, cum, tot: cum[cum.length - 1] };
+}
+function at(pp, u) { const tl = clamp(u, 0, 1) * pp.tot; let i = 1; while (i < pp.d.length - 1 && pp.cum[i] < tl) i++; const a = pp.cum[i - 1], b = pp.cum[i], w = b > a ? (tl - a) / (b - a) : 0; return [pp.d[i - 1][0] + (pp.d[i][0] - pp.d[i - 1][0]) * w, pp.d[i - 1][1] + (pp.d[i][1] - pp.d[i - 1][1]) * w]; }
+function fanCurves(g, A, P0, infl = 1) {
+  const rel = relOf(A.fc), x0 = g.x(g.last), y0 = g.y(P0);
+  return p => { const r = [[x0, y0]]; for (let k = 1; k <= A.H; k++) { const m = Math.log(rel(0.5, k)), l = Math.log(rel(p, k)); r.push([g.x(g.last + k), g.y(P0 * Math.exp(m + infl * (l - m)))]); } return r; };
+}
+/* Lapisan kipas: pita gradien 50/80/95%, benang kuantil halus, median emas ke cyan dengan pendar berlapis. Faktor infl membuka pita dari median saat animasi muncul. */
+function paintFan(c, g, A, P0, infl = 1) {
+  const curve = fanCurves(g, A, P0, infl), x0 = g.x(g.last), xe = g.x(g.last + A.H), stroke = e => { c.beginPath(); c.moveTo(e[0][0], e[0][1]); bez(c, e); c.stroke(); };
+  c.lineJoin = 'round'; c.lineCap = 'round';
+  const band = (a, b, stops, edgeA) => {
+    const up = curve(b), lo = curve(a).reverse(), gr = c.createLinearGradient(x0, 0, xe + 1, 0); stops.forEach(([o, col]) => gr.addColorStop(o, col));
+    c.beginPath(); c.moveTo(up[0][0], up[0][1]); bez(c, up); c.lineTo(lo[0][0], lo[0][1]); bez(c, lo); c.closePath(); c.fillStyle = gr; c.fill();
+    c.lineWidth = 1; c.strokeStyle = `rgba(40,184,216,${edgeA})`; stroke(up); stroke(lo);
+  };
+  if (cfg.b95) band(0.025, 0.975, [[0, 'rgba(40,184,216,.02)'], [1, 'rgba(40,184,216,.13)']], 0.16);
+  if (cfg.b80) band(0.1, 0.9, [[0, 'rgba(122,108,240,.04)'], [0.6, 'rgba(90,150,240,.16)'], [1, 'rgba(40,184,216,.22)']], 0.3);
+  if (cfg.b50) band(0.25, 0.75, [[0, 'rgba(247,183,51,.05)'], [1, 'rgba(247,183,51,.18)']], 0.35);
+  const N = S.lite ? 9 : cfg.lines; c.lineWidth = 0.9;
+  for (let i = 0; i < N; i++) { const p = (i + 0.5) / N; if (Math.abs(p - 0.5) < 0.5 / N) continue; c.strokeStyle = `rgba(40,184,216,${0.07 + 0.12 * (1 - Math.abs(2 * p - 1))})`; stroke(curve(p)); }
+  const m = curve(0.5), gr = c.createLinearGradient(x0, 0, xe + 1, 0); gr.addColorStop(0, '#f7b733'); gr.addColorStop(0.55, '#8fd3c0'); gr.addColorStop(1, '#28b8d8'); c.strokeStyle = gr;
+  [[13, 0.05], [8, 0.09], [5, 0.15]].forEach(([w, a]) => { c.lineWidth = w; c.globalAlpha = a; stroke(m); }); c.globalAlpha = 1; c.lineWidth = 3; stroke(m);
+}
+function drawForecast(g) {
+  const c = cx.fc; c.clearRect(0, 0, box.w, box.h); if (!g.showF) return;
+  const A = S.an, f = A.fc, H = A.H, t = performance.now() / 1000, rp = clamp(revealP(), 0, 1), P0 = S.visP || f.P0, x0 = g.x(g.last), xe = g.x(g.last + H), xr = x0 + (xe - x0) * rp + 2, br = 0.9 + 0.1 * Math.sin(t * 1.4);
+  const curve = fanCurves(g, A, P0), key = `${A.id}|${P0.toFixed(5)}|${x0.toFixed(1)}|${g.bw.toFixed(3)}|${g.hi.toFixed(5)}|${g.lo.toFixed(5)}|${box.w}|${box.h}|${cfg.b50}${cfg.b80}${cfg.b95}${cfg.lines}|${S.lite}`;
+  let pp; clip(c, g);
+  if (rp < 1 && S.tmpCtx) {
+    const tc = S.tmpCtx, fe = Math.max(18, (xe - x0) * 0.18);
+    tc.clearRect(0, 0, box.w, box.h); tc.save(); tc.beginPath(); tc.rect(PAD.l, PAD.t - 8, g.pw + 2, box.h - PAD.b - PAD.t + 8); tc.clip(); paintFan(tc, g, A, P0, Math.min(1, rp * 1.3)); tc.restore();
+    tc.globalCompositeOperation = 'destination-in'; tc.fillStyle = '#000'; tc.fillRect(0, 0, Math.max(0, xr - fe), box.h);
+    const mg = tc.createLinearGradient(xr - fe, 0, xr, 0); mg.addColorStop(0, 'rgba(0,0,0,1)'); mg.addColorStop(1, 'rgba(0,0,0,0)'); tc.fillStyle = mg; tc.fillRect(xr - fe, 0, fe, box.h); tc.globalCompositeOperation = 'source-over';
+    c.drawImage(S.tmp, 0, 0, box.w, box.h); pp = { dm: prep(curve(0.5)), du: prep(curve(0.9)), dl: prep(curve(0.1)) };
+  } else {
+    if (key !== S.fcKey) {
+      const o = S.offCtx; o.clearRect(0, 0, box.w, box.h); o.save(); o.beginPath(); o.rect(PAD.l, PAD.t - 8, g.pw + 2, box.h - PAD.b - PAD.t + 8); o.clip(); paintFan(o, g, A, P0); o.restore();
+      S.fcPrep = { dm: prep(curve(0.5)), du: prep(curve(0.9)), dl: prep(curve(0.1)) }; S.fcKey = key;
+    }
+    pp = S.fcPrep; c.globalAlpha = br; c.drawImage(S.off, 0, 0, box.w, box.h); c.globalAlpha = 1;
+  }
+  c.save(); c.beginPath(); c.rect(x0 - 4, 0, xr - x0 + 4, box.h); c.clip();
+  const stream = (p, n, sp, rgb, r, al) => {
+    for (let i = 0; i < n; i++) {
+      const u = (t * sp * (0.85 + (0.3 * ((i * 5) % 7)) / 6) + i / n) % 1;
+      for (let tr = 3; tr >= 1; tr--) { const uu = u - tr * 0.016; if (uu < 0) continue; const q = at(p, uu); if (q[0] > xr) continue; c.fillStyle = `rgba(${rgb},${al * (1 - tr * 0.26)})`; c.beginPath(); c.arc(q[0], q[1], r * (1 - tr * 0.18), 0, 7); c.fill(); }
+      const hp = at(p, u); if (hp[0] <= xr) orb(c, hp[0], hp[1], r + 1.2, rgb);
+    }
+  };
+  if (rp > 0.3) { stream(pp.dm, S.lite ? 6 : 12, 0.22, '247,183,51', 2.6, 0.7); if (!S.lite) { stream(pp.du, 4, 0.16, '40,184,216', 1.9, 0.45); stream(pp.dl, 4, 0.16, '40,184,216', 1.9, 0.45); } const pw = at(pp.dm, (t / 3.2) % 1); if (pw[0] <= xr) orb(c, pw[0], pw[1], 7, '255,255,255'); }
+  if (rp >= 0.98) { const en = pp.dm.d[pp.dm.d.length - 1]; orb(c, en[0], en[1], 9 + 1.5 * Math.sin(t * 3), '247,183,51'); }
+  c.restore();
+  if (rp < 1) {
+    const fp = pp.dm.d.find(q => q[0] >= xr) || pp.dm.d[pp.dm.d.length - 1], lg = c.createLinearGradient(xr - 16, 0, xr + 3, 0); lg.addColorStop(0, 'rgba(40,184,216,0)'); lg.addColorStop(0.8, 'rgba(120,220,240,.3)'); lg.addColorStop(1, 'rgba(255,255,255,0)');
+    c.fillStyle = lg; c.fillRect(xr - 16, PAD.t, 19, box.h - PAD.t - PAD.b); orb(c, fp[0], fp[1], 10 * (1 - rp * 0.4), '255,255,255'); orb(c, fp[0], fp[1], 6, '247,183,51');
+  }
+  c.restore();
+  const pop = clamp((rp - 0.82) / 0.18, 0, 1);
+  if (pop > 0) {
+    c.save(); c.globalAlpha = pop; c.font = '11px Geist, system-ui, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+    [[0.9, C.up], [0.5, C.amber], [0.1, C.down]].forEach(([p, col]) => { const v = f.Q(p, H), y = g.y(v); c.fillStyle = col; c.beginPath(); c.roundRect(box.w - PAD.r + 4, y - 10, PAD.r - 8, 20, 8); c.fill(); c.fillStyle = '#fff'; c.fillText(fmt(v, v >= 1000 && !S.digits ? 0 : undefined), box.w - PAD.r / 2, y); });
+    c.restore();
+  }
+}
+function drawBeam(c, g) {
+  if (!g.showF) return;
+  const t = performance.now() / 1000, x = g.x(g.last), y = g.y(S.visP || S.an.fc.P0), r = 14 + 2.4 * Math.sin(t * 2.2), h = box.h - PAD.t - PAD.b;
+  const bg = c.createLinearGradient(0, PAD.t, 0, box.h - PAD.b); bg.addColorStop(0, 'rgba(40,184,216,0)'); bg.addColorStop(0.5, 'rgba(40,184,216,.22)'); bg.addColorStop(1, 'rgba(40,184,216,0)');
+  c.fillStyle = bg; c.fillRect(x - 4, PAD.t, 8, h);
+  const yb = PAD.t + ((Math.sin(t * 0.9) + 1) / 2) * h, sg = c.createLinearGradient(0, yb - 40, 0, yb + 40); sg.addColorStop(0, 'rgba(255,255,255,0)'); sg.addColorStop(0.5, 'rgba(120,220,240,.6)'); sg.addColorStop(1, 'rgba(255,255,255,0)');
+  c.fillStyle = sg; c.fillRect(x - 2, yb - 40, 4, 80);
+  for (let i = 0; i < 2; i++) { const ph = (t / 2.4 + i * 0.5) % 1; c.strokeStyle = `rgba(247,183,51,${(1 - ph) * 0.45})`; c.lineWidth = 1.2; c.beginPath(); c.arc(x, y, 10 + ph * 44, 0, 7); c.stroke(); }
+  c.strokeStyle = 'rgba(40,184,216,.65)'; c.lineWidth = 1.5; c.beginPath(); c.arc(x, y, r, 0, 7); c.stroke();
+  orb(c, x, y, 7 + 1.2 * Math.sin(t * 3.1), '247,183,51'); orb(c, x, y, 4.5, '255,255,255'); if (S.rv.x < 1) orb(c, x, y, 8 + 16 * (1 - S.rv.x), '255,255,255');
+  c.font = '11px Geist, system-ui, sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.fillStyle = 'rgba(255,255,255,.92)'; c.beginPath(); c.roundRect(x - 34, PAD.t - 2, 68, 20, 10); c.fill(); c.fillStyle = '#0d1420'; c.fillText('Sekarang', x, PAD.t + 8);
+}
+function drawHud(g) {
+  const c = cx.hud, tip = $('#chart-tip'), L = S.candles[g.n - 1]; c.clearRect(0, 0, box.w, box.h); drawBeam(c, g);
+  c.font = '11.5px Geist, system-ui, sans-serif'; c.textBaseline = 'middle';
+  const tag = (txt, y, col) => { c.fillStyle = col; c.beginPath(); c.roundRect(box.w - PAD.r + 4, y - 10, PAD.r - 8, 20, 8); c.fill(); c.fillStyle = '#fff'; c.textAlign = 'center'; c.fillText(txt, box.w - PAD.r / 2 + 0, y); };
+  if (g.off === 0 && L.c < g.hi && L.c > g.lo) { const y = Math.round(g.y(L.c)) + 0.5, col = L.c >= L.o ? C.up : C.down; c.strokeStyle = col; c.setLineDash([3, 4]); c.beginPath(); c.moveTo(PAD.l, y); c.lineTo(box.w - PAD.r, y); c.stroke(); c.setLineDash([]); tag(fmt(L.c), y, col); }
+  const m = S.mouse;
+  if (!m || m.x < PAD.l || m.x > PAD.l + g.pw || m.y < PAD.t - 30 || m.y > box.h - PAD.b) { tip.hidden = true; return; }
+  c.strokeStyle = 'rgba(13,20,32,.35)'; c.setLineDash([4, 4]); c.beginPath(); c.moveTo(m.x, 0); c.lineTo(m.x, box.h - PAD.b); c.moveTo(PAD.l, m.y); c.lineTo(box.w - PAD.r, m.y); c.stroke(); c.setLineDash([]);
+  tag(fmt(g.hi - ((m.y - PAD.t) / g.ph) * (g.hi - g.lo)), m.y, '#0d1420');
+  const i = g.start + Math.floor((m.x - PAD.l) / g.bw), k = i - g.last; let html = '';
+  if (i >= g.start && i <= g.last) { const q = S.candles[i], ch = q.c / q.o - 1; html = `<b>${new Date(q.t).toISOString().slice(0, 16).replace('T', ' ')}</b><br>O ${fmt(q.o)}<br>H ${fmt(q.h)}<br>L ${fmt(q.l)}<br>C ${fmt(q.c)} <span data-dir="${dirOf(ch)}">${pct(ch)}</span>`; }
+  else if (k > 0 && g.showF && k <= S.an.H) {
+    const f = S.an.fc, A = S.an, P0 = S.visP || f.P0;
+    html = `<b>Prediksi +${k} candle</b><br>P10 ${fmt(f.Q(0.1, k))}<br>Median ${fmt(f.Q(0.5, k))}<br>P90 ${fmt(f.Q(0.9, k))}<br>Peluang naik ${(f.up(k) * 100).toFixed(0)}%`;
+    if (A.paths) {
+      const pr = g.hi - ((m.y - PAD.t) / g.ph) * (g.hi - g.lo); let best = A.paths[0]; A.paths.forEach(p => { if (Math.abs(p[k] * P0 - pr) < Math.abs(best[k] * P0 - pr)) best = p; });
+      const pts = best.map((v, j) => [g.x(g.last + j), g.y(v * P0)]);
+      c.strokeStyle = best[A.H] >= 1 ? C.up : C.down; c.beginPath(); c.moveTo(pts[0][0], pts[0][1]); bez(c, pts); c.lineWidth = 7; c.globalAlpha = 0.18; c.stroke(); c.globalAlpha = 1; c.lineWidth = 2; c.stroke();
+      html += `<br>Jalur analog ini berakhir di ${fmt(best[A.H] * P0)}`;
+    }
+  }
+  if (!html) { tip.hidden = true; return; }
+  tip.innerHTML = html; tip.hidden = false; tip.style.left = `${m.x > box.w - 220 ? m.x - 170 : m.x + 14}px`; tip.style.top = `${clamp(m.y + 14, 8, box.h - 130)}px`;
+}
+const STAGES = ['Tahap 1/4: baca candle tertutup', 'Tahap 2/4: cocokkan pola analog', 'Tahap 3/4: tilt bias TTFM dan GXT', 'Tahap 4/4: lengkungkan jalur dan baca spread'];
+let frameErr = 0;
+function frame(ts) {
+  try {
+    if (S.tF && ts - S.tF < 15.2) { requestAnimationFrame(frame); return; }
+    const dtm = S.tF ? ts - S.tF : 16.7; if (S.tF) S.dt = S.dt * 0.92 + dtm * 0.08; S.tF = ts; S.lite = S.dt > 26;
+    { const rv = S.rv, w = 5.5, ds = Math.min(dtm, 50) / 1000; if (rv.x < 1 || rv.v) { rv.v += (w * w * (1 - rv.x) - 2 * w * rv.v) * ds; rv.x += rv.v * ds; if (rv.x > 0.9995 && Math.abs(rv.v) < 0.002) { rv.x = 1; rv.v = 0; } } }
+    if (S.candles.length > 20) {
+      const lp = liveP(); S.visP = S.visP && Math.abs(S.visP - lp) < lp * 0.02 ? S.visP + (lp - S.visP) * (1 - Math.exp(-dtm / 90)) : lp;
+      const g = geom(), p = revealP(), anim = g.showF && p < 1;
+      if (S.qDirty) { S.qDirty = false; updateQuote(); S.lbDirty = true; }
+      if (S.lbDirty && ts - S.lbT > 66) { S.lbDirty = false; S.lbT = ts; liveBinds(); }
+      if (S.dirty) { drawGrid(g); drawCandles(g); S.dirty = false; }
+      drawForecast(g);
+      if (anim) bind('model.state', STAGES[Math.min(3, Math.floor(p * 4))]);
+      else if (S.stage && S.an) { S.stage = false; bind('model.state', S.an.fc.state); }
+      drawHud(g);
+    }
+  } catch (e) { if (frameErr++ < 3) { console.error(e); log(`Render gagal: ${e.message}`, 'error'); } S.view.off = 0; S.dirty = true; }
+  requestAnimationFrame(frame);
+}
+let pickCat = 'cry', pickQ = '';
+const pickCats = () => (cfg.provider === 'deriv' && S.dsyms && S.dsyms.length ? [['open', 'Buka sekarang'], ['cry', 'Kripto 24/7'], ['fx', 'Forex'], ['met', 'Logam dan energi'], ['idx', 'Indeks']] : [['cry', 'Kripto 24/7'], ...CATS]);
+const pickItems = () => (cfg.provider === 'deriv' && S.dsyms && S.dsyms.length ? S.dsyms.map(x => ({ c: x.c, s: x.s, n: x.n, open: x.open })) : (PRESETS[cfg.provider] || []).map(([c, s, n]) => ({ c, s, n, open: null })));
+function renderPicker() {
+  const cats = pickCats(); if (!cats.some(c => c[0] === pickCat)) pickCat = cats[0][0];
+  const q = pickQ.trim(), ql = q.toLowerCase(), all = pickItems(), items = all.filter(i => (ql ? `${i.s} ${i.n}`.toLowerCase().includes(ql) : pickCat === 'open' ? i.open : i.c === pickCat));
+  let h = items.map(i => `<li role="option" tabindex="0" data-s="${esc(i.s)}" aria-selected="${norm(i.s) === norm(cfg.symbol)}">${esc(i.n)}<span>${esc(i.s)}${i.open === null ? '' : `<small data-open="${i.open ? 1 : 0}">${i.open ? 'Buka' : 'Tutup'}</small>`}</span></li>`).join('');
+  if (q && /^[A-Za-z0-9/._-]{2,20}$/.test(q) && !all.some(i => norm(i.s) === norm(q))) { const cs = cfg.provider === 'deriv' ? q : q.toUpperCase(); h += `<li role="option" tabindex="0" data-s="${esc(cs)}">Pakai simbol ${esc(cs)}<span>kustom</span></li>`; }
+  $('#sym-items').innerHTML = h || '<li>Instrumen tidak ditemukan</li>';
+  $('#sym-cats').innerHTML = cats.map(([k, n]) => `<button type="button" data-cat="${k}" aria-pressed="${!ql && k === pickCat}">${n}</button>`).join('');
+}
+
+/* ===== NEWS: kalender ekonomi, berita geopolitik, globe 3D, skenario pasangan USD. Tanpa data usang: berita lebih dari 24 jam dibuang, sumber gagal ditampilkan apa adanya. ===== */
+const CTRY = `US|United States|39.8|-98.6|america,american,washington,white house,trump
+CA|Canada|56.1|-106.3|canadian,ottawa
+MX|Mexico|23.6|-102.5|mexican
+CU|Cuba|21.5|-77.8|cuban,havana
+BR|Brazil|-14.2|-51.9|brazilian,brasilia
+AR|Argentina|-38.4|-63.6|argentine,milei
+CL|Chile|-35.7|-71.5|chilean
+CO|Colombia|4.6|-74.1|colombian,bogota
+PE|Peru|-9.2|-75|peruvian,lima
+VE|Venezuela|6.4|-66.6|venezuelan,maduro,caracas
+EC|Ecuador|-1.8|-78.2|ecuadorian
+GB|United Kingdom|54|-2|britain,british,england,london,starmer,bank of england
+IE|Ireland|53.4|-8.2|irish,dublin
+FR|France|46.2|2.2|french,paris,macron
+DE|Germany|51.2|10.5|german,berlin,bundesbank
+IT|Italy|41.9|12.6|italian,rome,meloni
+ES|Spain|40.5|-3.7|spanish,madrid
+PT|Portugal|39.4|-8.2|portuguese,lisbon
+NL|Netherlands|52.1|5.3|dutch,amsterdam
+BE|Belgium|50.5|4.5|belgian
+CH|Switzerland|46.8|8.2|swiss
+AT|Austria|47.5|14.5|austrian,vienna
+PL|Poland|51.9|19.1|polish,warsaw
+UA|Ukraine|48.4|31.2|ukrainian,kyiv,kiev,zelensky
+RU|Russia|61.5|105.3|russian,moscow,putin,kremlin
+BY|Belarus|53.7|27.9|belarusian,minsk
+TR|Turkey|38.9|35.2|turkish,ankara,erdogan,istanbul
+GR|Greece|39.1|21.8|greek,athens
+SE|Sweden|60.1|18.6|swedish,stockholm
+NO|Norway|60.5|8.5|norwegian,oslo
+FI|Finland|61.9|25.7|finnish,helsinki
+DK|Denmark|56.3|9.5|danish,copenhagen
+IS|Iceland|64.9|-19|icelandic
+HU|Hungary|47.2|19.5|hungarian,budapest
+RO|Romania|45.9|25|romanian
+RS|Serbia|44|21|serbian,belgrade
+CZ|Czech Republic|49.8|15.5|czech,prague
+SK|Slovakia|48.7|19.7|slovak
+BG|Bulgaria|42.7|25.5|bulgarian
+HR|Croatia|45.1|15.2|croatian
+GE|Georgia|42.3|43.4|georgian,tbilisi
+AM|Armenia|40.1|45|armenian,yerevan
+AZ|Azerbaijan|40.1|47.6|azerbaijani,baku
+IL|Israel|31|34.9|israeli,tel aviv,jerusalem,netanyahu
+PS|Palestine|31.9|35.2|palestinian,gaza,west bank,hamas
+LB|Lebanon|33.9|35.9|lebanese,hezbollah,beirut
+SY|Syria|34.8|39|syrian,damascus
+IQ|Iraq|33.2|43.7|iraqi,baghdad
+IR|Iran|32.4|53.7|iranian,tehran
+SA|Saudi Arabia|23.9|45.1|saudi,riyadh,aramco
+AE|United Arab Emirates|23.4|53.8|emirati,dubai,abu dhabi
+QA|Qatar|25.4|51.2|qatari,doha
+KW|Kuwait|29.3|47.5|kuwaiti
+OM|Oman|21.5|55.9|omani
+BH|Bahrain|26|50.5|bahraini
+YE|Yemen|15.6|48.5|yemeni,houthi,houthis
+JO|Jordan|30.6|36.2|jordanian,amman
+EG|Egypt|26.8|30.8|egyptian,cairo
+LY|Libya|26.3|17.2|libyan,tripoli
+DZ|Algeria|28|1.7|algerian,algiers
+MA|Morocco|31.8|-7.1|moroccan,rabat
+TN|Tunisia|33.9|9.5|tunisian,tunis
+SD|Sudan|12.9|30.2|sudanese,khartoum
+SS|South Sudan|6.9|31.3|south sudanese,juba
+ET|Ethiopia|9.1|40.5|ethiopian,addis ababa
+SO|Somalia|5.2|46.2|somali,mogadishu
+KE|Kenya|-0|37.9|kenyan,nairobi
+NG|Nigeria|9.1|8.7|nigerian,abuja,lagos
+GH|Ghana|7.9|-1|ghanaian,accra
+SN|Senegal|14.5|-14.5|senegalese,dakar
+ML|Mali|17.6|-4|malian,bamako
+NE|Niger|17.6|8.1|nigerien,niamey
+BF|Burkina Faso|12.2|-1.6|burkinabe
+CD|DR Congo|-4|21.8|congolese,kinshasa
+ZA|South Africa|-30.6|22.9|south african,pretoria,johannesburg
+AO|Angola|-11.2|17.9|angolan,luanda
+TZ|Tanzania|-6.4|34.9|tanzanian
+UG|Uganda|1.4|32.3|ugandan,kampala
+ZW|Zimbabwe|-19|29.2|zimbabwean,harare
+CN|China|35.9|104.2|chinese,beijing,xi jinping,pboc,yuan,shanghai
+HK|Hong Kong|22.3|114.2|hong kong
+TW|Taiwan|23.7|121|taiwanese,taipei
+JP|Japan|36.2|138.3|japanese,tokyo,bank of japan,yen
+KR|South Korea|35.9|127.8|south korean,seoul
+KP|North Korea|40.3|127.5|north korean,pyongyang,kim jong
+IN|India|20.6|79|indian,new delhi,modi,mumbai,rupee
+PK|Pakistan|30.4|69.3|pakistani,islamabad
+BD|Bangladesh|23.7|90.4|bangladeshi,dhaka
+AF|Afghanistan|33.9|67.7|afghan,taliban,kabul
+LK|Sri Lanka|7.9|80.8|sri lankan,colombo
+NP|Nepal|28.4|84.1|nepali,kathmandu
+MM|Myanmar|21.9|96|burmese,burma
+TH|Thailand|15.9|101|thai,bangkok
+VN|Vietnam|14.1|108.3|vietnamese,hanoi
+KH|Cambodia|12.6|105|cambodian
+MY|Malaysia|4.2|102|malaysian,kuala lumpur
+SG|Singapore|1.35|103.8|singaporean
+ID|Indonesia|-0.8|113.9|indonesian,jakarta,prabowo,bank indonesia,rupiah
+PH|Philippines|12.9|121.8|philippine,filipino,manila
+KZ|Kazakhstan|48|66.9|kazakh,astana
+UZ|Uzbekistan|41.4|64.6|uzbek
+MN|Mongolia|46.9|103.8|mongolian
+AU|Australia|-25.3|133.8|australian,canberra,sydney,reserve bank of australia
+NZ|New Zealand|-40.9|174.9|kiwi,wellington,rbnz
+PG|Papua New Guinea|-6.3|144|papua new guinean
+CR|Costa Rica|9.7|-83.8|costa rican
+PA|Panama|8.5|-80.8|panamanian,panama canal
+GT|Guatemala|15.8|-90.2|guatemalan
+HN|Honduras|15.2|-86.2|honduran
+SV|El Salvador|13.8|-88.9|salvadoran,bukele
+BO|Bolivia|-16.3|-63.6|bolivian
+PY|Paraguay|-23.4|-58.4|paraguayan
+UY|Uruguay|-32.5|-55.8|uruguayan
+HT|Haiti|18.9|-72.3|haitian`.split('\n').map(l => { const p = l.split('|'); return { c: p[0], n: p[1], lat: +p[2], lon: +p[3], al: (p[4] || '').split(',').filter(Boolean) }; });
+const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const CMATCH = CTRY.map(x => ({ c: x.c, re: new RegExp(`\\b(${[x.n, ...x.al].filter(s => s.length >= 4).map(s => reEsc(s.toLowerCase())).join('|')})\\b`) }));
+const CCAPS = { US: /\bUSA?\b|\bU\.S\./, GB: /\bUK\b|\bU\.K\./, AE: /\bUAE\b/ };
+const detect = title => { const lo = title.toLowerCase(), out = []; for (const m of CMATCH) { if (m.re.test(lo) || (CCAPS[m.c] && CCAPS[m.c].test(title))) out.push(m.c); if (out.length >= 3) break; } return out; };
+const heat = t => (/\b(war|strike|strikes|missile|missiles|attack|attacks|killed|invasion|troops|bomb|bombing|clashes|shelling|drone|drones|ceasefire|hostage|hostages|coup)\b/i.test(t) ? 'war' : /\b(sanction|sanctions|tariff|tariffs|inflation|rate|rates|central bank|oil|opec|economy|recession|trade|gdp|jobs|fed|ecb|dollar|yuan|yen|gold)\b/i.test(t) ? 'econ' : 'pol');
+const NEWS = { items: [], cal: [], t1: 0, t2: 0, err1: '', err2: '', sel: null, byC: new Map() };
+const G = { S: 260, lon: 80, lat: 18, vlon: 0.006, drag: null, tgt: null, run: false, last: 0, w: 0, h: 0, land: [], cv: null, cx: null, nodes: [] };
+const ago = ms => { const s = Math.max(0, Math.floor((Date.now() - ms) / 1000)); return s < 90 ? `${s} dtk lalu` : s < 5400 ? `${Math.round(s / 60)} mnt lalu` : `${Math.round(s / 3600)} jam lalu`; };
+const fmtDur = ms => { const s = Math.abs(Math.floor(ms / 1000)), d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60); return d ? `${d} hari ${h} jam` : h ? `${h} jam ${m} mnt` : `${m} mnt ${String(s % 60).padStart(2, '0')} dtk`; };
+const flag = c => String.fromCodePoint(...[...c].map(ch => 127397 + ch.charCodeAt(0)));
+const dayLabel = t => new Intl.DateTimeFormat('id-ID', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(t)).replace(':', '.');
+async function getOne(url) {
+  const ac = new AbortController(), to = setTimeout(() => ac.abort(), 9000);
+  try { const r = await fetch(url, { signal: ac.signal, cache: 'no-store' }); if (!r.ok) throw new Error(`HTTP ${r.status}`); const tx = await r.text(); try { return JSON.parse(tx); } catch { throw new Error('bukan JSON'); } } finally { clearTimeout(to); }
+}
+async function firstOk(list, diag) {
+  for (const [n, u] of list) { try { const j = await getOne(u); diag.push({ n, ok: true }); return j; } catch (e) { diag.push({ n, ok: false, e: e.name === 'AbortError' ? 'timeout' : e.message === 'Failed to fetch' ? 'diblokir CORS atau jaringan' : e.message }); } }
+  return null;
+}
+const nyToUtc = (y, mo, d, h, m) => { let t = Date.UTC(y, mo - 1, d, 12, m); const nn = nyp(t); return t - (nn.h * 60 + nn.mi - (h * 60 + m)) * 6e4; };
+function fallbackCal() {
+  const now = Date.now(), out = [], b = nyp(now);
+  for (let k = 0; k < 4; k++) { const mo = ((b.mo - 1 + k) % 12) + 1, y = b.y + Math.floor((b.mo - 1 + k) / 12); let d = 1; while (new Date(Date.UTC(y, mo - 1, d)).getUTCDay() !== 5) d++; out.push({ title: 'Non-Farm Employment Change', cur: 'USD', t: nyToUtc(y, mo, d, 8, 30), imp: 'High', fc: '', pv: '', fb: true }); }
+  out.push({ title: 'FOMC Statement', cur: 'USD', t: nyToUtc(2026, 12, 9, 14, 0), imp: 'High', fc: '', pv: '', fb: true });
+  return out.filter(e => e.t >= now - 36e5 * 2 && e.t <= now + 40 * 864e5);
+}
+async function fetchHeadlines() {
+  const qs = `query=${encodeURIComponent('(war OR conflict OR sanctions OR tariff OR "central bank" OR inflation OR election OR oil OR OPEC OR ceasefire OR missile OR recession OR "interest rate" OR protest OR coup OR attack OR economy OR trade) sourcelang:english')}&mode=artlist&maxrecords=250&format=json&sort=datedesc&timespan=24h&_=${Math.floor(Date.now() / 60000)}`;
+  const diag = [], now = Date.now(), raw = [];
+  const g = await firstOk([['GDELT via Vercel', `/api/gdelt/api/v2/doc/doc?${qs}`], ['GDELT langsung', `https://api.gdeltproject.org/api/v2/doc/doc?${qs}`]], diag);
+  if (g) for (const a of g.articles || []) { const m = /^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)Z$/.exec(a.seendate || ''); if (m) raw.push({ title: a.title, url: a.url, dom: a.domain || '', t: Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) }); }
+  const rd = await firstOk([['Reddit r/worldnews', 'https://www.reddit.com/r/worldnews+geopolitics+economics/new.json?limit=100&raw_json=1']], diag);
+  if (rd && rd.data) for (const x of rd.data.children || []) { const d = x.data || {}; if (!d.over_18 && !d.stickied && d.title) raw.push({ title: d.title, url: d.url_overridden_by_dest || d.url, dom: d.domain || '', t: d.created_utc * 1000 }); }
+  NEWS.diag1 = diag; const seen = new Set();
+  const items = raw.map(a => ({ ...a, title: String(a.title || '').trim() })).filter(a => a.title && /^https?:\/\//.test(a.url || '') && now - a.t <= 864e5 && a.t <= now + 3e5 && !seen.has(a.title.toLowerCase()) && seen.add(a.title.toLowerCase())).map(a => ({ ...a, cs: detect(a.title), hot: heat(a.title) })).sort((x, y) => y.t - x.t);
+  if (!items.length) throw new Error(diag.map(d => `${d.n}: ${d.ok ? 'kosong' : d.e}`).join('; '));
+  NEWS.items = items; NEWS.t1 = now; NEWS.err1 = ''; indexNews();
+}
+async function fetchCal() {
+  const diag = [], ts = Math.floor(Date.now() / 60000), res = [], now = Date.now();
+  for (const wk of ['thisweek', 'nextweek']) { const a = await firstOk([[`Kalender ${wk} via Vercel`, `/api/cal/ff_calendar_${wk}.json?_=${ts}`], [`Kalender ${wk} langsung`, `https://nfs.faireconomy.media/ff_calendar_${wk}.json?_=${ts}`]], diag); if (Array.isArray(a)) res.push(...a); }
+  NEWS.diag2 = diag;
+  let cal = res.map(e => ({ title: String(e.title || ''), cur: String(e.country || ''), t: Date.parse(e.date), imp: e.impact, fc: e.forecast, pv: e.previous })).filter(e => Number.isFinite(e.t) && e.t >= now - 36e5 * 2 && e.t <= now + 8 * 864e5 && /High|Medium/.test(e.imp));
+  NEWS.fb = !res.length; if (NEWS.fb) cal = fallbackCal();
+  NEWS.cal = cal.sort((x, y) => x.t - y.t); NEWS.t2 = now; NEWS.err2 = NEWS.fb ? `sumber kalender gagal (${diag.filter(d => !d.ok).map(d => `${d.n}: ${d.e}`).join('; ')}), memakai jadwal tetap NFP dan FOMC tanpa konsensus` : '';
+}
+function indexNews() { const m = new Map(); for (const it of NEWS.items) for (const c of it.cs) { const e = m.get(c) || { n: 0, newest: 0, war: 0, items: [] }; e.n++; e.newest = Math.max(e.newest, it.t); if (it.hot === 'war') e.war++; e.items.push(it); m.set(c, e); } NEWS.byC = m; }
+function newsRow(a) { return `<li>${a.cs.map(c => `<span class="badge badge--usd">${flag(c)} ${c}</span>`).join('')}<a href="${esc(a.url)}" target="_blank" rel="noopener noreferrer">${esc(a.title)}</a><small>${esc(a.dom)}, ${ago(a.t)}</small></li>`; }
+function renderHeads() { const ul = $('#heads'), list = (NEWS.sel ? (NEWS.byC.get(NEWS.sel) || { items: [] }).items : NEWS.items).slice(0, 40); ul.innerHTML = list.length ? list.map(newsRow).join('') : `<li>${NEWS.err1 ? `Berita tidak bisa dimuat: ${esc(NEWS.err1)}` : NEWS.t1 ? 'Tidak ada berita dalam 24 jam terakhir untuk filter ini.' : 'Memuat berita...'}</li>`; }
+function renderStatus() {
+  const d = a => (a || []).map(x => `${x.n}: ${x.ok ? 'ok' : x.e}`).join('; ');
+  bind('news.status', `Berita: ${NEWS.t1 ? `diperbarui ${ago(NEWS.t1)}, ${NEWS.items.length} artikel dalam 24 jam terakhir` : NEWS.err1 ? `gagal (${NEWS.err1})` : 'memuat'}. Kalender: ${NEWS.t2 ? `diperbarui ${ago(NEWS.t2)}${NEWS.fb ? ', jadwal tetap (sumber utama gagal)' : ''}` : NEWS.err2 ? `gagal (${NEWS.err2})` : 'memuat'}.${NEWS.diag1 ? ` Sumber berita: ${d(NEWS.diag1)}.` : ''}${NEWS.diag2 && NEWS.fb ? ` Sumber kalender: ${d(NEWS.diag2)}.` : ''}`);
+}
+function renderCal() {
+  const ul = $('#cal'); if (!ul) return; const now = Date.now(), list = NEWS.cal.filter(e => e.t >= now - 36e5).slice(0, 40);
+  ul.innerHTML = list.length ? list.map(e => `<li><span class="badge ${e.imp === 'High' ? 'badge--high' : 'badge--med'}">${e.imp === 'High' ? 'Tinggi' : 'Sedang'}</span><span class="badge badge--usd">${esc(e.cur)}</span><b>${esc(e.title)}</b><small>${dayLabel(e.t)}, ${e.t > now ? `dalam ${fmtDur(e.t - now)}` : `rilis ${fmtDur(now - e.t)} lalu`}${e.fc ? `, konsensus ${esc(e.fc)}` : ''}${e.pv ? `, sebelumnya ${esc(e.pv)}` : ''}</small></li>`).join('') : `<li>${NEWS.err2 ? `Kalender tidak bisa dimuat: ${esc(NEWS.err2)}` : NEWS.t2 ? 'Tidak ada event berdampak sedang atau tinggi dalam 8 hari ke depan.' : 'Memuat kalender...'}</li>`;
+}
+/* Skenario pasangan USD. Peluang USD menguat = Phi(beta * polaritas * z), z = (aktual - konsensus) / sigma tipikal. beta adalah prior model (belum dikalibrasi), peluang pra-rilis dianggap 50/50. */
+const EVT = [[/non-?farm|\bnfp\b/i, 'NFP', 1, 75, 'K'], [/core cpi|\bcpi\b/i, 'CPI', 1, 0.1, '%'], [/\bppi\b/i, 'PPI', 1, 0.2, '%'], [/fomc|federal funds|interest rate decision|rate statement/i, 'FOMC', 1, 0, ''], [/unemployment rate|jobless claims|unemployment claims/i, 'Pengangguran', -1, 0.1, ''], [/retail sales/i, 'Penjualan ritel', 1, 0.5, '%'], [/\bgdp\b/i, 'GDP', 1, 0.4, '%'], [/\bpce\b/i, 'PCE', 1, 0.1, '%'], [/\bism\b|\bpmi\b/i, 'PMI', 1, 1.5, ''], [/jolts|\badp\b|employment change/i, 'Tenaga kerja', 1, 60, 'K'], [/powell|fed chair|speaks/i, 'Pidato Fed', 1, 0, '']];
+const numOf = s => { const m = /(-?\d+(?:\.\d+)?)/.exec(String(s || '')); return m ? +m[1] : NaN; };
+const USD_BETA = 0.55;
+/* Momentum USD 24 jam dari instrumen aktif (candle H4), dinormalkan terhadap sebaran historisnya */
+function usdMomentum() {
+  const h4 = getH4(); if (h4.length < 60) return null; const s = String(cfg.symbol).replace(/^frx|^cry/, '').replace(/[^A-Za-z]/g, '').toUpperCase(), base = /^USD[A-Z]{3}$/.test(s), quote = /^[A-Z]{3}USD$/.test(s) || /^XAU|^XAG|^BTC|^ETH/.test(s);
+  if (!base && !quote) return null; const r = []; for (let i = 6; i < h4.length; i++) r.push(Math.log(h4[i].c / h4[i - 6].c));
+  return (base ? 1 : -1) * clamp(Math.log(h4[h4.length - 1].c / h4[h4.length - 7].c) / (std(r) || 1e-6), -3, 3);
+}
+/* Peluang USD menguat sebelum rilis = logistik dari faktor terukur: momentum USD, posisi COT mata uang pasangan, dan tilt konsensus terhadap sebelumnya. Bobot adalah prior model, belum dikalibrasi. */
+function preUsd(e) {
+  const t = EVT.find(x => x[0].test(e.title)) || [0, 'Rilis', 1, 0, ''], pol = t[2], sg = t[3], f = numOf(e.fc), pv = numOf(e.pv), fac = []; let lg = 0;
+  const mom = usdMomentum(); if (mom !== null) { const x = mom * 0.3; lg += x; fac.push(`momentum USD 24 jam z ${mom.toFixed(2)} (${mom >= 0 ? 'USD menguat' : 'USD melemah'}) ${x >= 0 ? '+' : ''}${x.toFixed(2)}`); }
+  const key = symKey(); if (S.cot && ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF', 'NZDUSD'].includes(key)) { const usd = /^USD/.test(key) ? S.cot.dir : -S.cot.dir, x = usd * Math.min(1.5, Math.abs(S.cot.z) / 1.5 + 0.3) * 0.25; lg += x; fac.push(`posisi COT ${key} (${S.cot.date}) ${x >= 0 ? '+' : ''}${x.toFixed(2)}`); }
+  if (sg && Number.isFinite(f) && Number.isFinite(pv)) { const x = pol * clamp((f - pv) / sg, -1.5, 1.5) * 0.2; lg += x; fac.push(`tilt konsensus ${f} vs sebelumnya ${pv} ${x >= 0 ? '+' : ''}${x.toFixed(2)}`); }
+  const p = 1 / (1 + Math.exp(-lg)), c = Math.abs(p - 0.5); return { p, fac, conf: c < 0.04 ? 'rendah' : c < 0.09 ? 'sedang' : 'tinggi' };
+}
+function scnRows(e) {
+  const t = EVT.find(x => x[0].test(e.title)) || [0, 'Rilis', 1, 0, ''], pol = t[2], sg = t[3], u = t[4], f = numOf(e.fc), hawk = t[1] === 'FOMC' || t[1] === 'Pidato Fed';
+  const labs = hawk ? ['Dovish kuat', 'Dovish', 'Sesuai ekspektasi', 'Hawkish', 'Hawkish kuat'] : ['Jauh di bawah konsensus', 'Di bawah konsensus', 'Sesuai konsensus', 'Di atas konsensus', 'Jauh di atas konsensus'];
+  return [-2, -1, 0, 1, 2].map((z, i) => { const p = cdf(USD_BETA * pol * z), th = sg && Number.isFinite(f) ? ` (${(f + z * sg).toFixed(u === 'K' ? 0 : 1)}${u})` : ''; return `<tr><td>${labs[i]}${th}</td><td>${(p * 100).toFixed(0)}%</td><td>${(p * 100).toFixed(0)}% / ${((1 - p) * 100).toFixed(0)}%</td><td>${((1 - p) * 100).toFixed(0)}% / ${(p * 100).toFixed(0)}%</td></tr>`; }).join('');
+}
+function scnLive(e, val) {
+  const t = EVT.find(x => x[0].test(e.title)), f = numOf(e.fc), a = numOf(val); if (!t || !t[3] || !Number.isFinite(f) || !Number.isFinite(a)) return 'Isi nilai aktual untuk melihat skenario terdekat (butuh konsensus numerik).';
+  const z = clamp((a - f) / t[3], -4, 4), p = cdf(USD_BETA * t[2] * z); return `z = ${z >= 0 ? '+' : ''}${z.toFixed(2)}: USD menguat ${(p * 100).toFixed(0)}%. Berawalan USD: BUY ${(p * 100).toFixed(0)}% / SELL ${((1 - p) * 100).toFixed(0)}%. Berakhiran USD: BUY ${((1 - p) * 100).toFixed(0)}% / SELL ${(p * 100).toFixed(0)}%.`;
+}
+function renderScn() {
+  const box2 = $('#usd-scn'); if (!box2) return; const now = Date.now(), list = NEWS.cal.filter(e => e.cur === 'USD' && e.imp === 'High' && e.t >= now - 36e5).slice(0, 4);
+  box2.innerHTML = list.length ? list.map((e, i) => {
+    const pr = preUsd(e), pu = (pr.p * 100).toFixed(0), pd = (100 - pr.p * 100).toFixed(0), k = S.candles.find(c => c.t <= e.t && c.t + TF[cfg.tf] > e.t), rx = e.t < now && k && TF[cfg.tf] <= 9e5 ? `Reaksi harga ${esc(dispName(cfg.symbol))} sejak rilis: ${((liveP() - k.o) / pipOf(cfg.symbol, k.o)).toFixed(0)} pips.` : '';
+    return `<div class="scn-card" data-i="${i}"><h3>${esc(e.title)}${e.fb ? ' <span class="badge badge--med">jadwal tetap</span>' : ''}</h3><p class="note">${dayLabel(e.t)}, ${e.t > now ? `dalam ${fmtDur(e.t - now)}` : `rilis ${fmtDur(now - e.t)} lalu`}${e.fc ? `. Konsensus ${esc(e.fc)}, sebelumnya ${esc(e.pv || '-')}` : ''}</p>
+    <div class="pre"><div class="meter"><span style="width:${pu}%"></span></div><div class="meter-lab"><b>USD menguat ${pu}%</b><b>USD melemah ${pd}%</b></div>
+    <div class="pairs"><div><strong>Berawalan USD</strong><small>USDJPY, USDCHF, USDCAD</small><i class="buy">BUY ${pu}%</i><i class="sell">SELL ${pd}%</i></div><div><strong>Berakhiran USD</strong><small>EURUSD, GBPUSD, AUDUSD, XAUUSD</small><i class="buy">BUY ${pd}%</i><i class="sell">SELL ${pu}%</i></div></div>
+    <p class="note">Keyakinan pra-rilis ${pr.conf}. Faktor: ${pr.fac.length ? pr.fac.join('; ') : 'momentum dan COT belum tersedia untuk instrumen ini, hasilnya 50/50'}. Bobot model adalah prior, belum dikalibrasi.</p></div>
+    <details><summary>Skenario setelah angka aktual keluar</summary><div class="table-wrap"><table class="scn"><thead><tr><th>Hasil</th><th>USD kuat</th><th>Berawalan USD<br>BUY / SELL</th><th>Berakhiran USD<br>BUY / SELL</th></tr></thead><tbody>${scnRows(e)}</tbody></table></div>
+    <label class="field"><span>Nilai aktual setelah rilis</span><input type="text" class="act" inputmode="decimal" placeholder="contoh 180"></label><p class="note act-out">${scnLive(e, '')}</p></details><p class="note">${rx}</p></div>`; }).join('') : `<p class="note">${NEWS.t2 ? 'Tidak ada rilis USD berdampak tinggi dalam jangkauan kalender.' : 'Memuat kalender...'}</p>`;
+}
+function renderGlobeInfo() {
+  const el = $('#globe-info'), sel = NEWS.sel && NEWS.byC.get(NEWS.sel), cn = CTRY.find(x => x.c === NEWS.sel);
+  if (sel && cn) el.innerHTML = `<h3>${flag(cn.c)} ${esc(cn.n)}</h3><p class="note">${sel.n} berita dalam 24 jam terakhir, terbaru ${ago(sel.newest)}. <button type="button" class="btn" data-c="">Tampilkan semua</button></p>`;
+  else { const top = [...NEWS.byC.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 10); el.innerHTML = `<p class="note">Geser untuk memutar globe, ketuk titik negara untuk memfilter berita.</p><div class="chips">${top.map(([c, e]) => `<button type="button" class="btn" data-c="${c}">${flag(c)} ${esc((CTRY.find(x => x.c === c) || { n: c }).n)} (${e.n})</button>`).join('')}</div>`; }
+}
+function renderNews() { renderStatus(); renderCal(); renderScn(); renderHeads(); renderGlobeInfo(); }
+function selectCountry(c) { NEWS.sel = c || null; const cn = CTRY.find(x => x.c === c); if (cn) G.tgt = { lon: cn.lon, lat: clamp(cn.lat, -50, 50) }; renderGlobeInfo(); renderHeads(); }
+let newsTimer = 0, cdTimer = 0;
+async function refreshNews() {
+  const now = Date.now(), jobs = [];
+  if (now - NEWS.t1 > 110000) jobs.push(fetchHeadlines().catch(e => { NEWS.err1 = e.message; }));
+  if (now - NEWS.t2 > 290000) jobs.push(fetchCal().catch(e => { NEWS.err2 = e.message; }));
+  await Promise.all(jobs);
+  if (NEWS.t1 && Date.now() - NEWS.t1 > 12 * 60000) { NEWS.items = []; indexNews(); }
+  renderNews();
+}
+/* Globe 3D: bumi diproyeksikan per piksel dari tekstur satelit (siang dan malam, terminator mengikuti jam UTC sekarang). Tanpa tekstur: palet bioma dari garis pantai. */
+const gproj = (la, lo, R, x0, y0) => { const p = (la * Math.PI) / 180, l = ((lo - G.lon) * Math.PI) / 180, p0 = (G.lat * Math.PI) / 180, cc = Math.sin(p0) * Math.sin(p) + Math.cos(p0) * Math.cos(p) * Math.cos(l); return { x: x0 + R * Math.cos(p) * Math.sin(l), y: y0 - R * (Math.cos(p0) * Math.sin(p) - Math.sin(p0) * Math.cos(p) * Math.cos(l)), z: cc }; };
+const limbPt = (q, R, x0, y0) => { const dx = q.x - x0, dy = q.y - y0, h = Math.hypot(dx, dy) || 1; return [x0 + (dx / h) * R, y0 + (dy / h) * R]; };
+const gfill = (c, ring, R, x0, y0) => {
+  const pts = []; let any = false;
+  for (const [la, lo] of ring) { const q = gproj(la, lo, R, x0, y0); if (q.z > 0) { pts.push([q.x, q.y]); any = true; } else pts.push(limbPt(q, R, x0, y0)); }
+  if (!any) return; c0.beginPath(); pts.forEach((p, i) => (i ? c0.lineTo(p[0], p[1]) : c0.moveTo(p[0], p[1]))); c0.closePath(); c0.fill();
+};
+let c0 = null;
+function topoRings(topo, name) {
+  const [sx, sy] = topo.transform.scale, [tx, ty] = topo.transform.translate, arcs = topo.arcs.map(a => { let x = 0, y = 0; return a.map(([dx, dy]) => { x += dx; y += dy; return [x * sx + tx, y * sy + ty]; }); });
+  const ring = idx => { const pts = []; for (const i of idx) { const a = i < 0 ? arcs[~i].slice().reverse() : arcs[i]; for (let k = pts.length ? 1 : 0; k < a.length; k++) pts.push([a[k][1], a[k][0]]); } return pts; };
+  const out = [], obj = topo.objects[name], geoms = obj.geometries || [obj];
+  for (const g of geoms) { if (g.type === 'Polygon') g.arcs.forEach(r => out.push(ring(r))); else if (g.type === 'MultiPolygon') g.arcs.forEach(p => p.forEach(r => out.push(ring(r)))); }
+  return out;
+}
+async function loadLand() { try { const r = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json'); G.land = topoRings(await r.json(), 'land'); } catch { G.land = []; } }
+const TEX = { day: null, night: null };
+const TEXU = { day: ['https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg', 'https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-blue-marble.jpg'], night: ['https://unpkg.com/three-globe/example/img/earth-night.jpg', 'https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg'] };
+function loadTex(urls) {
+  return new Promise(res => { let i = 0; const next = () => { if (i >= urls.length) return res(null); const im = new Image(); im.crossOrigin = 'anonymous'; im.onload = () => { try { const c = document.createElement('canvas'); c.width = 1024; c.height = 512; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(im, 0, 0, 1024, 512); res(x.getImageData(0, 0, 1024, 512).data); } catch { i++; next(); } }; im.onerror = () => { i++; next(); }; im.src = urls[i]; }; next(); });
+}
+async function loadTextures() { TEX.day = await loadTex(TEXU.day); if (TEX.day) TEX.night = await loadTex(TEXU.night); }
+function sunPos(now) { const d = new Date(now), doy = (Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - Date.UTC(d.getUTCFullYear(), 0, 0)) / 864e5, hrs = d.getUTCHours() + d.getUTCMinutes() / 60 + d.getUTCSeconds() / 3600; return { lat: -23.44 * Math.cos(((2 * Math.PI) / 365) * (doy + 10)), lon: -15 * (hrs - 12) }; }
+function renderSphere() {
+  const N = G.S, d = G.img.data, W = 1024, H = 512, td = TEX.day, tn = TEX.night, p0 = (G.lat * Math.PI) / 180, l0 = (G.lon * Math.PI) / 180, sp = sunPos(Date.now()), sd = (sp.lat * Math.PI) / 180, sl = (sp.lon * Math.PI) / 180;
+  const ex = Math.cos(l0), ez = -Math.sin(l0), nx = -Math.sin(p0) * Math.sin(l0), ny = Math.cos(p0), nz = -Math.sin(p0) * Math.cos(l0), fx = Math.cos(p0) * Math.sin(l0), fy = Math.sin(p0), fz = Math.cos(p0) * Math.cos(l0);
+  const sx = Math.cos(sd) * Math.sin(sl), sy = Math.sin(sd), sz = Math.cos(sd) * Math.cos(sl); let o = 0;
+  for (let py = 0; py < N; py++) {
+    const y = 1 - (2 * (py + 0.5)) / N;
+    for (let px = 0; px < N; px++, o += 4) {
+      const x = (2 * (px + 0.5)) / N - 1, r2 = x * x + y * y; if (r2 >= 1) { d[o + 3] = 0; continue; }
+      const z = Math.sqrt(1 - r2), wx = x * ex + y * nx + z * fx, wy = y * ny + z * fy, wz = x * ez + y * nz + z * fz;
+      const u = Math.min(W - 1, (((Math.atan2(wx, wz) + Math.PI) / (2 * Math.PI)) * W) | 0), v = Math.min(H - 1, (((Math.PI / 2 - Math.asin(wy)) / Math.PI) * H) | 0), ti = (v * W + u) * 4;
+      const dif = wx * sx + wy * sy + wz * sz, day = clamp(dif * 5 + 0.5, 0, 1), limb = 0.6 + 0.4 * z, rim = Math.pow(1 - z, 3) * 90, sh = (0.2 + 0.8 * day) * limb;
+      let r = td[ti] * sh, g = td[ti + 1] * sh, b = td[ti + 2] * sh;
+      if (tn) { const k = (1 - day) * 1.15; r += tn[ti] * k; g += tn[ti + 1] * k; b += tn[ti + 2] * k; } else { r += 6 * (1 - day); g += 10 * (1 - day); b += 26 * (1 - day); }
+      if (td[ti + 2] > td[ti] + 12 && td[ti + 2] >= td[ti + 1]) { const spc = Math.pow(Math.max(0, dif) * z, 22) * 110; r += spc; g += spc; b += spc; }
+      d[o] = r + rim * 0.25; d[o + 1] = g + rim * 0.5; d[o + 2] = b + rim; d[o + 3] = Math.min(255, (1 - r2) * 255 * 14);
+    }
+  }
+  G.scx.putImageData(G.img, 0, 0);
+}
+function drawFallback(c, R, x0, y0) {
+  const og = c.createRadialGradient(x0 - R * 0.3, y0 - R * 0.35, R * 0.1, x0, y0, R); og.addColorStop(0, '#4fa3e8'); og.addColorStop(0.6, '#1f6db5'); og.addColorStop(1, '#0a3a78'); c.fillStyle = og; c.beginPath(); c.arc(x0, y0, R, 0, 7); c.fill();
+  const np = gproj(90, 0, R, x0, y0), sp = gproj(-90, 0, R, x0, y0), lg = c.createLinearGradient(sp.x, sp.y, np.x, np.y);
+  [[0, '#eef5f8'], [0.07, '#cfe0e6'], [0.2, '#6a9a5c'], [0.32, '#b3a46a'], [0.43, '#3f8a4d'], [0.5, '#2f7f45'], [0.57, '#3f8a4d'], [0.68, '#b3a46a'], [0.8, '#6a9a5c'], [0.93, '#cfe0e6'], [1, '#f3f8fa']].forEach(([o, col]) => lg.addColorStop(o, col));
+  c.save(); c.beginPath(); c.arc(x0, y0, R, 0, 7); c.clip(); c.fillStyle = lg; c0 = c; for (const r of G.land) gfill(c, r, R, x0, y0);
+  const sh = c.createRadialGradient(x0 - R * 0.35, y0 - R * 0.4, R * 0.2, x0, y0, R * 1.05); sh.addColorStop(0, 'rgba(255,255,255,.2)'); sh.addColorStop(0.55, 'rgba(0,0,0,0)'); sh.addColorStop(1, 'rgba(0,20,60,.45)'); c.fillStyle = sh; c.fillRect(x0 - R, y0 - R, 2 * R, 2 * R); c.restore();
+}
+function globeFrame(ts) {
+  if (!G.run) return; requestAnimationFrame(globeFrame);
+  if (ts - G.last < 30 || !G.cx || !G.w) return; const dt = G.last ? ts - G.last : 30; G.last = ts;
+  if (G.tgt) { const dl = ((G.tgt.lon - G.lon + 540) % 360) - 180; G.lon += dl * Math.min(1, dt / 220); G.lat += (G.tgt.lat - G.lat) * Math.min(1, dt / 220); if (Math.abs(dl) < 0.3) G.tgt = null; }
+  else if (!G.drag) { G.lon += G.vlon * dt; G.vlon += (0.006 - G.vlon) * Math.min(1, dt / 900); }
+  const c = G.cx, R = Math.min(G.w, G.h) * 0.42, x0 = G.w / 2, y0 = G.h / 2, t = ts / 1000; c.clearRect(0, 0, G.w, G.h);
+  const ag = c.createRadialGradient(x0, y0, R * 0.95, x0, y0, R * 1.25); ag.addColorStop(0, 'rgba(70,160,255,.42)'); ag.addColorStop(0.5, 'rgba(70,160,255,.12)'); ag.addColorStop(1, 'rgba(70,160,255,0)'); c.fillStyle = ag; c.beginPath(); c.arc(x0, y0, R * 1.25, 0, 7); c.fill();
+  if (TEX.day) { renderSphere(); c.imageSmoothingQuality = 'high'; c.drawImage(G.sc, x0 - R, y0 - R, 2 * R, 2 * R); } else drawFallback(c, R, x0, y0);
+  G.nodes = [];
+  for (const cn of CTRY) {
+    const e = NEWS.byC.get(cn.c); if (!e) continue; const q = gproj(cn.lat, cn.lon, R, x0, y0); if (q.z <= 0.02) continue;
+    const r = 3.5 + 2.4 * Math.sqrt(e.n), col = e.war ? '255,80,80' : '255,214,102', fresh = Date.now() - e.newest < 36e5, sel = NEWS.sel === cn.c;
+    G.nodes.push({ c: cn.c, x: q.x, y: q.y, r: r + 8 });
+    const gr = c.createRadialGradient(q.x, q.y, 0, q.x, q.y, r * 2.8); gr.addColorStop(0, `rgba(${col},.85)`); gr.addColorStop(1, `rgba(${col},0)`); c.fillStyle = gr; c.beginPath(); c.arc(q.x, q.y, r * 2.8, 0, 7); c.fill();
+    c.fillStyle = '#fff'; c.beginPath(); c.arc(q.x, q.y, r * 0.42, 0, 7); c.fill();
+    if (fresh) { const ph = (t * 0.6 + cn.lon * 0.013) % 1; c.strokeStyle = `rgba(${col},${(1 - ph) * 0.7})`; c.lineWidth = 1.4; c.beginPath(); c.arc(q.x, q.y, r * (0.8 + ph * 2.4), 0, 7); c.stroke(); }
+    if (sel) { c.strokeStyle = '#fff'; c.lineWidth = 2; c.beginPath(); c.arc(q.x, q.y, r + 5, 0, 7); c.stroke(); }
+    if (q.z > 0.45 && (e.n >= 4 || sel)) { c.fillStyle = 'rgba(255,255,255,.95)'; c.strokeStyle = 'rgba(0,20,60,.7)'; c.lineWidth = 3; c.font = '600 11px Geist, system-ui, sans-serif'; c.textAlign = 'center'; c.strokeText(cn.n, q.x, q.y - r - 7); c.fillText(cn.n, q.x, q.y - r - 7); }
+  }
+}
+function initGlobe() {
+  const cv = $('#globe'), wrap = $('#globe-wrap'); if (!cv) return; G.cv = cv; G.cx = cv.getContext('2d'); G.S = 260; G.sc = document.createElement('canvas'); G.sc.width = G.sc.height = G.S; G.scx = G.sc.getContext('2d'); G.img = new ImageData(G.S, G.S);
+  new ResizeObserver(() => { const r = wrap.getBoundingClientRect(), d = Math.min(devicePixelRatio || 1, 2); G.w = r.width; G.h = r.height; cv.width = r.width * d; cv.height = r.height * d; G.cx.setTransform(d, 0, 0, d, 0, 0); }).observe(wrap);
+  wrap.addEventListener('pointerdown', e => { G.drag = { x: e.clientX, y: e.clientY, lon: G.lon, lat: G.lat, moved: false, t: performance.now() }; G.tgt = null; wrap.setPointerCapture(e.pointerId); });
+  wrap.addEventListener('pointermove', e => { const d = G.drag; if (!d) return; const dx = e.clientX - d.x, dy = e.clientY - d.y, k = 90 / (Math.min(G.w, G.h) * 0.42); if (Math.abs(dx) + Math.abs(dy) > 6) d.moved = true; G.lon = d.lon - dx * k; G.lat = clamp(d.lat + dy * k, -80, 80); });
+  wrap.addEventListener('pointerup', e => { const d = G.drag; G.drag = null; if (!d || d.moved) return; const r = wrap.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top; let best = null, bd = 1e9; for (const n of G.nodes) { const dd = Math.hypot(n.x - px, n.y - py); if (dd < Math.max(22, n.r) && dd < bd) { bd = dd; best = n; } } selectCountry(best ? best.c : null); });
+  $('#globe-info').addEventListener('click', e => { const b = e.target.closest('button[data-c]'); if (b) selectCountry(b.dataset.c); });
+  $('#usd-scn').addEventListener('input', e => { if (!e.target.classList.contains('act')) return; const card = e.target.closest('.scn-card'), ev = NEWS.cal.filter(x => x.cur === 'USD' && x.imp === 'High' && x.t >= Date.now() - 36e5 * 2).slice(0, 3)[+card.dataset.i]; if (ev) card.querySelector('.act-out').textContent = scnLive(ev, e.target.value); });
+  loadLand(); loadTextures();
+}
+function newsOpen() { refreshNews(); clearInterval(newsTimer); newsTimer = setInterval(refreshNews, 60000); clearInterval(cdTimer); cdTimer = setInterval(() => { renderCal(); renderStatus(); }, 1000); G.run = true; G.last = 0; requestAnimationFrame(globeFrame); }
+function newsClose() { clearInterval(newsTimer); clearInterval(cdTimer); G.run = false; }
+function initNews() {
+  document.body.dataset.view = 'market';
+  $$('.views [data-view]').forEach(b => { b.onclick = () => { const v = b.dataset.view; document.body.dataset.view = v; $$('.views [data-view]').forEach(o => o.setAttribute('aria-selected', String(o === b))); if (v === 'news') newsOpen(); else newsClose(); }; });
+  initGlobe(); renderNews();
+  setInterval(() => { if (S.ctx.ready) ctxPull(false); }, 600000); setInterval(() => { if (S.ctx.ready) extPull(); }, 300000);
+}
+
+/* Antarmuka */
+const zoom = f => { S.zoomed = true; S.view.bars = clamp(S.view.bars * f, 20, 400); S.dirty = true; };
+const apply = () => { queue(true); S.dirty = true; };
+function fillForm() {
+  $(`input[name="source"][value="${cfg.source}"]`).checked = true; $('#cfg-endpoint').value = cfg.endpoint; $('#cfg-endpoint').disabled = cfg.source !== 'external';
+  $('#cfg-drift').value = cfg.drift; $('#cfg-dist').value = cfg.dist; $('#cfg-smt').value = cfg.smt; $('#cfg-exec').value = cfg.exec;
+  ['50', '80', '95'].forEach(b => { $(`#cfg-band${b}`).checked = cfg[`b${b}`]; });
+  [['wq', 'q'], ['wt', 't'], ['wg', 'g']].forEach(([k, s]) => { $(`#cfg-${k}`).value = cfg[k]; bind(`cfg.${k}`, cfg[k]); void s; });
+}
+function readForm() {
+  const old = pairSym(); cfg.source = $('input[name="source"]:checked').value; cfg.endpoint = $('#cfg-endpoint').value.trim();
+  cfg.drift = $('#cfg-drift').value; cfg.dist = $('#cfg-dist').value; cfg.smt = $('#cfg-smt').value; { const ox = cfg.exec; cfg.exec = $('#cfg-exec').value; if (cfg.exec !== ox) { S.ctx = freshCtx(); S.ctx.started = true; ctxPull(true); } }
+  ['50', '80', '95'].forEach(b => { cfg[`b${b}`] = $(`#cfg-band${b}`).checked; });
+  ['wq', 'wt', 'wg'].forEach(k => { cfg[k] = +$(`#cfg-${k}`).value; });
+  save(); S.btKey = ''; S.ext = null; if (pairSym() !== old) load(); else apply();
+}
+function initUi() {
+  const menu = $('#symbol-list'), btn = $('#symbol-btn'), toggle = v => { menu.hidden = !v; btn.setAttribute('aria-expanded', String(v)); };
+  btn.onclick = e => { e.stopPropagation(); toggle(menu.hidden); };
+  const list = $('#symbol-list');
+  list.addEventListener('click', e => {
+    e.stopPropagation(); const b = e.target.closest('[data-cat]'), li = e.target.closest('li[data-s]');
+    if (b) { pickCat = b.dataset.cat; pickQ = ''; $('#sym-q').value = ''; renderPicker(); }
+    else if (li) { cfg.symbol = li.dataset.s; save(); toggle(false); renderPicker(); load(); }
+  });
+  list.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.matches('li[data-s]')) e.target.click(); });
+  $('#sym-q').oninput = e => { pickQ = e.target.value; renderPicker(); };
+  document.addEventListener('click', () => toggle(false)); document.addEventListener('keydown', e => { if (e.key === 'Escape') toggle(false); });
+  $$('#tf [data-tf]').forEach(b => { b.setAttribute('aria-checked', String(b.dataset.tf === cfg.tf)); b.onclick = () => { cfg.tf = b.dataset.tf; $$('#tf [data-tf]').forEach(o => o.setAttribute('aria-checked', String(o === b))); save(); load(); }; });
+  $$('[data-layer]').forEach(b => { b.setAttribute('aria-pressed', String(!!cfg.layers[b.dataset.layer])); b.onclick = () => { const k = b.dataset.layer; cfg.layers[k] = !cfg.layers[k]; b.setAttribute('aria-pressed', String(cfg.layers[k])); save(); S.dirty = true; }; });
+  $$('[data-zoom]').forEach(b => { b.onclick = () => { const z = b.dataset.zoom; if (z === 'in') zoom(0.8); else if (z === 'out') zoom(1.25); else { S.zoomed = z === 'fit'; S.view.bars = z === 'fit' ? 160 : box.w < 520 ? 60 : 90; if (z === 'reset') S.view.off = 0; S.dirty = true; } }; });
+  const tabs = $$('[role="tab"]'); tabs.forEach((t, i) => {
+    t.onclick = () => tabs.forEach(o => { const on = o === t; o.setAttribute('aria-selected', String(on)); o.tabIndex = on ? 0 : -1; $(`#${o.getAttribute('aria-controls')}`).hidden = !on; });
+    t.onkeydown = e => { const j = e.key === 'ArrowRight' ? i + 1 : e.key === 'ArrowLeft' ? i - 1 : -1; if (j >= 0) { const n = tabs[(j + tabs.length) % tabs.length]; n.focus(); n.click(); } };
+  });
+  const hz = $('#cfg-horizon'), cn = $('#cfg-context'), ln = $('#cfg-lines');
+  hz.value = cfg.horizon; cn.value = cfg.context; ln.value = cfg.lines; bind('cfg.horizon', cfg.horizon); bind('cfg.context', cfg.context);
+  hz.oninput = () => { cfg.horizon = +hz.value; bind('cfg.horizon', cfg.horizon); save(); queue(); refreshExternal(); };
+  cn.onchange = () => { cfg.context = +cn.value; bind('cfg.context', cfg.context); save(); S.btKey = ''; queue(true); };
+  ln.onchange = () => { cfg.lines = +ln.value; save(); S.dirty = true; };
+  const dlg = $('#settings'); $('#btn-settings').onclick = () => { fillForm(); dlg.showModal(); };
+  dlg.addEventListener('close', () => { if (dlg.returnValue === 'save') readForm(); dlg.returnValue = ''; });
+  $$('input[name="source"]').forEach(r => { r.onchange = () => { $('#cfg-endpoint').disabled = r.value !== 'external'; }; });
+  [['wq', 'wq'], ['wt', 'wt'], ['wg', 'wg']].forEach(([id, k]) => { $(`#cfg-${id}`).oninput = e => bind(`cfg.${k}`, e.target.value); });
+  $('#btn-reset').onclick = () => { Object.assign(cfg, { ...DEF, symbol: cfg.symbol, tf: cfg.tf, horizon: cfg.horizon, context: cfg.context, lines: cfg.lines, layers: cfg.layers }); fillForm(); };
+  $('#btn-fullscreen').onclick = () => { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen?.(); };
+  $('#btn-retry').onclick = load;
+  $('#chart-notice').addEventListener('click', e => { const b = e.target.closest('button[data-s]'); if (b) { cfg.symbol = b.dataset.s; save(); renderPicker(); load(); } });
+  const cd = $('#connect'), syncConnect = () => { const v = $('input[name="provider"]:checked').value; $('#cfg-relay').disabled = v !== 'relay'; $('#cfg-key').disabled = v !== 'twelve'; };
+  $$('input[name="provider"]').forEach(r => { r.onchange = syncConnect; });
+  $('#btn-connect').onclick = () => { $(`input[name="provider"][value="${cfg.provider}"]`).checked = true; $('#cfg-relay').value = cfg.relayUrl; $('#cfg-key').value = cfg.apiKey; syncConnect(); cd.showModal(); };
+  cd.addEventListener('close', () => {
+    if (cd.returnValue === 'connect') {
+      const prev = cfg.provider; cfg.provider = $('input[name="provider"]:checked').value; cfg.relayUrl = $('#cfg-relay').value.trim(); cfg.apiKey = $('#cfg-key').value.trim();
+      if (cfg.provider !== prev) { cfg.symbol = { deriv: 'frxXAUUSD', twelve: 'XAU/USD', relay: 'XAUUSD' }[cfg.provider]; cfg.smt = 'auto'; }
+      save(); renderPicker(); load();
+    }
+    cd.returnValue = '';
+  });
+  const ch = $('#chart'); let drag = null;
+  const pos = e => { const r = ch.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+  ch.addEventListener('pointerdown', e => { if (e.target.closest('button, .chart__notice, .chart__error')) return; drag = { x: e.clientX, off: S.view.off }; ch.setPointerCapture(e.pointerId); });
+  ch.addEventListener('pointermove', e => { S.mouse = pos(e); S.hud = true; if (drag) { S.view.off = drag.off + (e.clientX - drag.x) / (geom().bw || 1); S.dirty = true; } });
+  ch.addEventListener('pointerup', () => { drag = null; }); ch.addEventListener('pointerleave', () => { S.mouse = null; S.hud = true; });
+  ch.addEventListener('wheel', e => { e.preventDefault(); zoom(e.deltaY > 0 ? 1.1 : 0.9); }, { passive: false });
+  ch.addEventListener('keydown', e => { const k = e.key; if (k === 'ArrowLeft') S.view.off += 5; else if (k === 'ArrowRight') S.view.off -= 5; else if (k === '+' || k === '=') zoom(0.8); else if (k === '-') zoom(1.25); else return; S.dirty = true; e.preventDefault(); });
+  new ResizeObserver(resize).observe(ch);
+}
+
+colors();
+function colors() { C = { up: css('--up', '#0f9f7a'), down: css('--down', '#e5484d'), ink3: css('--ink-3', '#8390a4'), cyan: css('--cyan', '#28b8d8'), amber: css('--amber', '#f7a935'), iris: css('--iris', '#7a6cf0') }; }
+window.lucide?.createIcons();
+renderPicker(); initUi(); initNews(); $$('details.card, details.ctl').forEach(d => { d.open = innerWidth >= 1180; }); resize(); load(); if (!ready()) $('#btn-connect').click(); setInterval(heartbeat, 1000); requestAnimationFrame(frame);
+})();
