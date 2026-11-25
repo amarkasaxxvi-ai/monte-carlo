@@ -1,6 +1,0 @@
-{
-  "rewrites": [
-    { "source": "/api/gdelt/:path*", "destination": "https://api.gdeltproject.org/:path*" },
-    { "source": "/api/cal/:path*", "destination": "https://nfs.faireconomy.media/:path*" }
-  ]
-}
